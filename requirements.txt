@@ -1,0 +1,9 @@
+# Core
+ldap3>=2.9.1        # LDAP queries (signing check, MAQ, DFL, computer objects)
+rich>=13.0.0        # Terminal tables and coloured output
+impacket>=0.11.0    # SMB/NTLM protocol support (mssqlclient, smbclient)
+
+# Optional but highly recommended (install separately on Kali)
+# nxc (netexec)     - apt install netexec   OR  pipx install netexec
+# certipy-ad        - pip install certipy-ad
+# bloodyAD          - pip install bloodyad
