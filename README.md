@@ -376,10 +376,10 @@ ntlm_relay_checker/
 
 ## To Do List
 
-Add Pass-the-hash instead of password:
+Fix pass-the-hash support — --nt-hash flag exists as an alternative to -p but the hash is not yet passed correctly to underlying tool calls. Currently falls back to empty password, causing checks to fail.
 
 ```bash
-python relayhound.py -d sevenkingdoms.local --dc-ip 192.168.164.10 -u cersei.lannister --nt-hash aad3b435b51404eeaad3b435b51404ee:HASH
+python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv --nt-hash <nthash>
 ```
 
 ### Legal Disclaimer
