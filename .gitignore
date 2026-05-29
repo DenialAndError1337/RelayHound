@@ -1,6 +1,7 @@
 # Generated report files
 *_report.md
 *_report.html
+*_report.json
 *_relay_targets.txt
 
 # Python cache

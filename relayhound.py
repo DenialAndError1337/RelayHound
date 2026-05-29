@@ -29,6 +29,8 @@ from ntlm_relay_checker.engine import (
 from ntlm_relay_checker.output import (
     CheckProgress,
     print_summary_table,
+    print_verbose_details,
+    print_attack_paths,
     print_relay_target_summary,
     write_markdown_report,
     write_html_report,
@@ -249,11 +251,24 @@ def main() -> int:
     elapsed = time.time() - start
     print()
 
+    # env_summary used by attack paths, reports, and JSON
+    env_summary = {
+        "domain":        env.domain,
+        "dc_ip":         env.dc_ip,
+        "user":          cred.upn,
+        "attacker_ip":   env.attacker_ip,
+        "extra_targets": extra,
+    }
+
     # ── Print terminal summary ─────────────────────────────────────
-    print_summary_table(results, verbose=args.verbose)
+    # Order: summary table → attack paths → relay targets → verbose details
+    print_summary_table(results)
+    print_attack_paths(results, env_summary, relay_target_summary)
 
     if relay_target_summary is not None:
         print_relay_target_summary(relay_target_summary)
+
+    print_verbose_details(results, verbose=args.verbose)
 
     try:
         from rich.console import Console
@@ -264,12 +279,6 @@ def main() -> int:
     # ── Write reports ──────────────────────────────────────────────
     if not args.no_report:
         out_path = args.output or f"{args.domain.split('.')[0]}_ntlm_relay_report.md"
-        env_summary = {
-            "domain":       env.domain,
-            "dc_ip":        env.dc_ip,
-            "user":         cred.upn,
-            "extra_targets": extra,
-        }
         write_markdown_report(
             results, env_summary, out_path,
             relay_target_summary=relay_target_summary,

