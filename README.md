@@ -6,7 +6,9 @@ Automated tool to check whether a target Active Directory environment meets the 
 
 ## ⚠️ Scope and Intended Use
 
-**RelayHound is a passive reconnaissance tool. It does not perform any exploitation.**
+**RelayHound is a read-only reconnaissance tool. It does not perform any exploitation.**
+
+Note: RelayHound does make active network connections to target systems. It authenticates against SMB, LDAP, MSSQL and other services to enumerate their configuration. It will appear in authentication logs and generate network traffic.
 
 All checks are read-only enumeration queries. No authentication is coerced, no tickets are relayed, no objects are modified, and no payloads are executed. Command suggestions shown in the output (e.g. `printerbug.py`, `ntlmrelayx.py`) are informational text only and are never run by the tool.
 
