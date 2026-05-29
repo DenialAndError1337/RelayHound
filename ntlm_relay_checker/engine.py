@@ -28,10 +28,15 @@ ATTACK_MODULES = [
 def run_all_checks(
     env: TargetEnv,
     progress_callback: Callable[[str, str, CheckResult], None] | None = None,
+    modules: list | None = None,
+    delay: int = 0,
+    jitter: int = 0,
 ) -> list[AttackResult]:
+    import time, random
+    active = modules if modules is not None else ATTACK_MODULES
     results: list[AttackResult] = []
 
-    for mod_path, attack_name in ATTACK_MODULES:
+    for i, (mod_path, attack_name) in enumerate(active):
         try:
             mod = importlib.import_module(mod_path)
         except ImportError as e:
@@ -54,14 +59,21 @@ def run_all_checks(
 
         results.append(ar)
 
+        # Apply delay + jitter between modules (not after the last one)
+        if delay > 0 and i < len(active) - 1:
+            sleep_time = delay + (random.randint(0, jitter) if jitter > 0 else 0)
+            time.sleep(sleep_time)
+
     return results
 
 
 def run_checks_parallel(
     env: TargetEnv,
     progress_callback: Callable[[str, str, CheckResult], None] | None = None,
+    modules: list | None = None,
 ) -> list[AttackResult]:
-    results: list[AttackResult | None] = [None] * len(ATTACK_MODULES)
+    active = modules if modules is not None else ATTACK_MODULES
+    results: list[AttackResult | None] = [None] * len(active)
     lock = threading.Lock()
 
     def run_attack(idx: int, mod_path: str, attack_name: str) -> None:
@@ -89,7 +101,7 @@ def run_checks_parallel(
         results[idx] = ar
 
     threads = []
-    for i, (mod_path, attack_name) in enumerate(ATTACK_MODULES):
+    for i, (mod_path, attack_name) in enumerate(active):
         t = threading.Thread(target=run_attack, args=(i, mod_path, attack_name), daemon=True)
         threads.append(t)
         t.start()

@@ -34,6 +34,7 @@ from ntlm_relay_checker.output import (
     print_relay_target_summary,
     write_markdown_report,
     write_html_report,
+    write_json_report,
     write_relay_list,
 )
 
@@ -102,6 +103,13 @@ Examples:
                       help="Show per-check details in terminal output")
     opts.add_argument("--parallel",       action="store_true",
                       help="Run attack checks in parallel (faster, noisier)")
+    opts.add_argument("--modules",        default=None,
+                      help="Comma-separated list of module short names to run "
+                           "(e.g. smb,rbcd,adcs). Invalid names print valid aliases and exit.")
+    opts.add_argument("--delay",          type=int, default=0,
+                      help="Sleep N seconds between each attack module (default: 0)")
+    opts.add_argument("--jitter",         type=int, default=0,
+                      help="Add up to N seconds of random variation to the delay (default: 0)")
     opts.add_argument("--timeout",        type=int, default=10,
                       help="Network timeout in seconds (default: 10)")
     opts.add_argument("-o", "--output",   default=None,
@@ -112,6 +120,10 @@ Examples:
                       help="Skip writing the Markdown and HTML reports")
     opts.add_argument("--no-html",        action="store_true",
                       help="Skip writing the HTML report (keep Markdown only)")
+    opts.add_argument("--output-json",    default=None,
+                      help="JSON report path (default: <domain>_ntlm_relay_report.json)")
+    opts.add_argument("--no-json",        action="store_true",
+                      help="Skip writing the JSON report")
     opts.add_argument("--relay-list",    default=None,
                       help="Save SMB unsigned hosts to this file for ntlmrelayx -tf")
     opts.add_argument("--no-relay-list", action="store_true",
@@ -183,6 +195,37 @@ def main() -> int:
     except ImportError:
         print(BANNER)
 
+    # ── Resolve --modules filter ───────────────────────────────────
+    from ntlm_relay_checker.engine import ATTACK_MODULES
+
+    # Short name aliases: maps lower-case alias → index in ATTACK_MODULES
+    MODULE_ALIASES: dict[str, int] = {
+        "smb":           0,
+        "rbcd":          1,
+        "shadowcreds":   2,
+        "adcs":          3,
+        "mssql":         4,
+        "webdav":        5,
+        "kerberos":      6,
+        "esc11":         7,
+        "laps":          8,
+        "addcomputer":   9,
+        "acl":          10,
+    }
+
+    if args.modules:
+        requested = [m.strip().lower() for m in args.modules.split(",") if m.strip()]
+        invalid = [m for m in requested if m not in MODULE_ALIASES]
+        if invalid:
+            print(f"[!] Unknown module(s): {', '.join(invalid)}")
+            print(f"    Valid names: {', '.join(MODULE_ALIASES)}")
+            return 1
+        # Keep canonical order regardless of input order
+        selected_indices = sorted(set(MODULE_ALIASES[m] for m in requested))
+        active_modules = [ATTACK_MODULES[i] for i in selected_indices]
+    else:
+        active_modules = ATTACK_MODULES
+
     cred = Credential(
         domain=args.domain,
         username=args.username,
@@ -217,6 +260,8 @@ def main() -> int:
             f"[bold]Attacker IP:[/]      {env.attacker_ip or 'not specified'}\n"
             f"[bold]Timeout:[/]          {env.timeout}s\n"
             f"[bold]Mode:[/]             {'parallel' if args.parallel else 'sequential'}\n"
+            f"[bold]Modules:[/]          {args.modules or 'all'}\n"
+            f"[bold]Delay / jitter:[/]   {args.delay}s / {args.jitter}s\n"
             f"[bold]Find relay targets:[/] {'yes' if args.find_relay_targets else 'no'}",
             title="Run Configuration",
             border_style="blue",
@@ -228,15 +273,19 @@ def main() -> int:
         print(f"[*] Targets: {env.all_targets}")
 
     # ── Run checks ─────────────────────────────────────────────────
+    import random
     progress = CheckProgress(verbose=args.verbose)
 
     print()
     start = time.time()
 
     if args.parallel:
-        results = run_checks_parallel(env, progress_callback=progress.update)
+        results = run_checks_parallel(env, progress_callback=progress.update,
+                                      modules=active_modules)
     else:
-        results = run_all_checks(env, progress_callback=progress.update)
+        results = run_all_checks(env, progress_callback=progress.update,
+                                 modules=active_modules,
+                                 delay=args.delay, jitter=args.jitter)
 
     # ── Run relay target finder (if requested) ─────────────────────
     relay_target_summary = None
@@ -302,6 +351,18 @@ def main() -> int:
                 Console().print(f"[green]✓ HTML report saved:[/]     [bold]{html_path}[/]")
             except ImportError:
                 print(f"[+] HTML report saved: {html_path}")
+
+    if not args.no_json:
+        json_path = args.output_json or f"{args.domain.split('.')[0]}_ntlm_relay_report.json"
+        write_json_report(
+            results, env_summary, json_path,
+            relay_target_summary=relay_target_summary,
+        )
+        try:
+            from rich.console import Console
+            Console().print(f"[green]✓ JSON report saved:[/]      [bold]{json_path}[/]")
+        except ImportError:
+            print(f"[+] JSON report saved: {json_path}")
 
     # ── Write relay target list ────────────────────────────────────
     if not args.no_relay_list:

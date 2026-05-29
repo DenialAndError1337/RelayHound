@@ -958,6 +958,75 @@ def _build_remediation(results: list[AttackResult]) -> list[tuple[str, str]]:
 
 
 
+# ── JSON report ────────────────────────────────────────────────────────────
+
+def write_json_report(
+    results: list[AttackResult],
+    env_summary: dict,
+    output_path: str,
+    relay_target_summary: RelayTargetSummary | None = None,
+) -> None:
+    """Write a machine-readable JSON report."""
+    import json
+    from datetime import datetime
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    data: dict = {
+        "generated": now,
+        "domain":    env_summary.get("domain", ""),
+        "dc_ip":     env_summary.get("dc_ip", ""),
+        "user":      env_summary.get("user", ""),
+        "extra_targets": env_summary.get("extra_targets", []),
+        "results": [],
+    }
+
+    for ar in results:
+        data["results"].append({
+            "attack":     ar.attack_name,
+            "viability":  ar.viability,
+            "missing":    ar.missing,
+            "skipped":    ar.skipped,
+            "checks": [
+                {
+                    "name":     c.name,
+                    "status":   str(c.status),
+                    "required": c.required,
+                    "detail":   c.detail if isinstance(c.detail, str) else str(c.detail),
+                }
+                for c in ar.checks
+            ],
+        })
+
+    if relay_target_summary and relay_target_summary.entries:
+        data["relay_targets"] = [
+            {
+                "account":       e.account,
+                "attack":        e.attack,
+                "target_object": e.target_object,
+                "right":         e.right,
+            }
+            for e in relay_target_summary.entries
+        ]
+
+    chains = _build_attack_chains(results, env_summary)
+    if chains:
+        data["attack_paths"] = [
+            {
+                "tier":     c.tier,
+                "title":    c.title,
+                "prereqs":  c.prereqs,
+                "coerce":   c.coerce_cmd,
+                "relay":    c.relay_cmd,
+                "notes":    c.notes or "",
+            }
+            for c in chains
+        ]
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
 # ── SMB relay target list ──────────────────────────────────────────────────
 
 def write_relay_list(results: list[AttackResult], output_path: str) -> int:
