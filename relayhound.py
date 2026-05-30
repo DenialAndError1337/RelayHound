@@ -28,6 +28,7 @@ from ntlm_relay_checker.engine import (
 )
 from ntlm_relay_checker.startup import (
     query_domain_controllers,
+    resolve_hostname_map,
     format_dc_discovery_line,
 )
 from ntlm_relay_checker.output import (
@@ -92,8 +93,10 @@ Examples:
                           "domains/forests) so they rank as DC-level targets in attack paths")
     tgt.add_argument("--extra-targets",  default="",
                      help="Comma-separated IPs, hostnames, CIDR ranges, or dash ranges")
-    tgt.add_argument("--attacker-ip",    default=None,
+    tgt.add_argument("--attacker-ip",       default=None,
                      help="Attacker/relay listener IP (your Kali box)")
+    tgt.add_argument("--attacker-hostname", default=None,
+                     help="Your Kali/attacker hostname — used for WebDAV coercion and ADIDNS commands in attack paths")
 
     # Credentials
     cred = p.add_argument_group("Credentials")
@@ -253,6 +256,7 @@ def main() -> int:
         cred=cred,
         extra_targets=extra,
         attacker_ip=args.attacker_ip,
+        attacker_hostname=args.attacker_hostname,
         timeout=args.timeout,
         verbose=args.verbose,
         find_relay_targets=args.find_relay_targets,
@@ -269,8 +273,11 @@ def main() -> int:
         _C().print("[dim]Querying domain for DC IPs...[/]", end="")
     except ImportError:
         print("[*] Querying domain for DC IPs...", end="")
-    discovered = query_domain_controllers(env)
+    discovered, dc_hmap = query_domain_controllers(env)
     env.dc_ips = list(dict.fromkeys(env.dc_ips + discovered))
+    # Reverse-resolve extra targets for hostname map, then merge DC hostnames
+    env.hostname_map = resolve_hostname_map(extra)
+    env.hostname_map.update(dc_hmap)
     try:
         from rich.console import Console as _C
         _C().print(f" [dim]found {len(env.dc_ips)}[/]")
@@ -290,6 +297,7 @@ def main() -> int:
             f"[bold]Auth:[/]             {'NT hash' if cred.nt_hash else 'Password'}\n"
             f"[bold]Extra targets:[/]    {', '.join(extra) or 'none'}\n"
             f"[bold]Attacker IP:[/]      {env.attacker_ip or 'not specified'}\n"
+            f"[bold]Attacker Host:[/]    {env.attacker_hostname or 'not specified'}\n"
             f"[bold]Timeout:[/]          {env.timeout}s\n"
             f"[bold]Mode:[/]             {'parallel' if args.parallel else 'sequential'}\n"
             f"[bold]Modules:[/]          {args.modules or 'all'}\n"
@@ -338,7 +346,9 @@ def main() -> int:
         "dc_ip":         env.dc_ip,
         "dc_ips":        env.dc_ips,
         "user":          cred.upn,
-        "attacker_ip":   env.attacker_ip,
+        "attacker_ip":       env.attacker_ip,
+        "attacker_hostname": env.attacker_hostname,
+        "hostname_map":      env.hostname_map,
         "extra_targets": extra,
     }
 

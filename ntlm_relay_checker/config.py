@@ -35,7 +35,8 @@ class TargetEnv:
     extra_targets: list[str] = field(default_factory=list)
 
     # Attacker-controlled host (for relay description text)
-    attacker_ip: Optional[str] = None
+    attacker_ip:       Optional[str] = None
+    attacker_hostname: Optional[str] = None
 
     # Timeouts
     timeout: int = 10
@@ -48,7 +49,9 @@ class TargetEnv:
 
     # All DC IPs discovered via LDAP at startup (populated by relayhound.py
     # after env construction; falls back to [dc_ip] if discovery fails).
-    dc_ips: list[str] = field(default_factory=list)
+    dc_ips:       list[str]       = field(default_factory=list)
+    # IP → short hostname map built at startup (covers DCs + extra targets)
+    hostname_map: dict[str, str]  = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Ensure dc_ips always contains at least the primary DC so modules

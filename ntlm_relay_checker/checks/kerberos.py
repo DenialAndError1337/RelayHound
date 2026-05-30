@@ -480,10 +480,8 @@ class KrbCoercionMethodCheck(BaseCheck):
                 detail=(
                     f"Print Spooler running on: {', '.join(spooler_hosts)}. "
                     "PrinterBug coercion available. "
-                    "Use Forshaw-encoded hostname as callback to trigger Kerberos DNS auth "
-                    "(not plain attacker IP — that produces NTLM). "
-                    "Command: `printerbug.py '<domain>/<user>:<pass>@<target>' "
-                    "'<forshaw_encoded_hostname>'`"
+                    "Use the Forshaw-encoded hostname as the callback (not a plain IP) "
+                    "— see Recommended Attack Paths for the full command."
                 ),
             )
 
@@ -492,7 +490,7 @@ class KrbCoercionMethodCheck(BaseCheck):
             detail=(
                 "Could not confirm Print Spooler status. "
                 "Check manually: PrinterBug (MS-RPRN), PetitPotam (MS-EFSRPC). "
-                "Remember: use Forshaw-encoded hostname as callback, not plain IP."
+                "Use the Forshaw-encoded hostname as the callback — see Recommended Attack Paths."
             ),
         )
 
@@ -608,7 +606,7 @@ class WebClientCoercionCheck(BaseCheck):
     Not needed for PrinterBug (RPC-based).
     """
 
-    name = "WebClient running on target (required for PetitPotam HTTP coercion)"
+    name = "WebClient running on target (enables PetitPotam WebDAV/HTTP coercion)"
     required = False
 
     def _run(self) -> CheckResult:
@@ -640,15 +638,15 @@ class WebClientCoercionCheck(BaseCheck):
                 name=self.name, status=Status.PASS,
                 detail=(
                     f"WebClient running on: {', '.join(webclient_hosts)}. "
-                    "PetitPotam HTTP coercion available for krbrelayx. "
-                    "PrinterBug coercion works regardless of WebClient."
+                    "PetitPotam WebDAV/HTTP coercion available. "
+                    "PrinterBug (MS-RPRN) coercion works regardless of WebClient."
                 ),
             )
         return CheckResult(
             name=self.name, status=Status.WARN,
             detail=(
-                "WebClient not confirmed — PetitPotam HTTP coercion unavailable. "
-                "Use PrinterBug (MS-RPRN) or PetitPotam RPC coercion instead."
+                "WebClient not confirmed — PetitPotam WebDAV/HTTP coercion unavailable. "
+                "Use PrinterBug (MS-RPRN) or PetitPotam SMB/RPC coercion instead."
             ),
         )
 
