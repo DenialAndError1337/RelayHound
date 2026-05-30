@@ -118,7 +118,7 @@ Examples:
                       help="Comma-separated list of module short names to run "
                            "(e.g. smb,rbcd,adcs). Invalid names print valid aliases and exit.")
     opts.add_argument("--delay",          type=int, default=0,
-                      help="Sleep N seconds between each attack module (default: 0)")
+                      help="Sleep N seconds between each attack module (default: 0). Also randomises module execution order")
     opts.add_argument("--jitter",         type=int, default=0,
                       help="Add up to N seconds of random variation to the delay (default: 0)")
     opts.add_argument("--timeout",        type=int, default=10,

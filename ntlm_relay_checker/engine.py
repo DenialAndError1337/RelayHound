@@ -33,7 +33,9 @@ def run_all_checks(
     jitter: int = 0,
 ) -> list[AttackResult]:
     import time, random
-    active = modules if modules is not None else ATTACK_MODULES
+    active = list(modules if modules is not None else ATTACK_MODULES)
+    if delay > 0:
+        random.shuffle(active)
     results: list[AttackResult] = []
 
     for i, (mod_path, attack_name) in enumerate(active):

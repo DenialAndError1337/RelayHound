@@ -3,6 +3,7 @@
 *_report.html
 *_report.json
 *_relay_targets.txt
+*_laps_computers.txt
 
 # Python cache
 __pycache__/

