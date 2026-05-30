@@ -158,7 +158,9 @@ Target:
                             targets in attack paths
   --extra-targets           Comma-separated IPs, hostnames, CIDR ranges,
                             or dash ranges (e.g. 10.0.0.1,10.0.0.0/24,10.0.0.10-20)
-  --attacker-ip             Your Kali/attacker IP — used to populate relay
+  --attacker-ip             Your Kali/attacker IP — used to populate
+                            commands in the attack paths output
+  --attacker-hostname       Your Kali/attacker hostname — used to populate
                             commands in the attack paths output
   --targets-file            File with target IPs/ranges, one per line (# for comments)
 
