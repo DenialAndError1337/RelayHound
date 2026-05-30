@@ -40,10 +40,17 @@ def _ldap_connect(env: TargetEnv) -> Optional[object]:
         return None
     try:
         server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
+        # ldap3 NTLM accepts NT hash as "LMHASH:NTHASH" in the password field.
+        # Use the empty LM hash prefix when only the NT hash is supplied.
+        if env.cred.nt_hash:
+            nh = env.cred.nt_hash.split(":")[-1]  # strip LM: prefix if present
+            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
+        else:
+            auth_password = env.cred.password
         conn = Connection(
             server,
             user=env.cred.upn,
-            password=env.cred.password,
+            password=auth_password,
             authentication=NTLM,
             auto_bind=True,
         )
@@ -54,10 +61,14 @@ def _ldap_connect(env: TargetEnv) -> Optional[object]:
 
 def _run_bloodyad(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
     try:
+        if env.cred.nt_hash:
+            nh = env.cred.nt_hash.split(":")[-1]
+            auth = ["--dc-ip", env.dc_ip, "-p", f":{nh}"]
+        else:
+            auth = ["-p", env.cred.password]
         cmd = ["bloodyAD", "--host", env.dc_ip,
                "-d", env.domain,
-               "-u", env.cred.username,
-               "-p", env.cred.password] + args
+               "-u", env.cred.username] + auth + args
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
@@ -68,10 +79,11 @@ def _run_bloodyad(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[i
 
 def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
     try:
+        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
+                else ["-p", env.cred.password])
         cmd = ["nxc", "ldap", env.dc_ip,
                "-u", env.cred.username,
-               "-p", env.cred.password,
-               "-d", env.domain] + args
+               "-d", env.domain] + auth + args
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
@@ -364,7 +376,7 @@ class AdcsForPkinitCheck(BaseCheck):
         rc2, out2, err2 = _run_certipy([
             "find",
             "-u", f"{self.env.cred.username}@{self.env.domain}",
-            "-p", self.env.cred.password,
+            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
         ])
@@ -401,7 +413,7 @@ class WebClientCoercionCheck(BaseCheck):
                 r = subprocess.run(
                     ["nxc", "smb", host,
                      "-u", self.env.cred.username,
-                     "-p", self.env.cred.password,
+                     *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                      "-d", self.env.domain,
                      "--module", "webdav"],
                     capture_output=True, text=True,
@@ -460,7 +472,7 @@ class DcKdcCertificateCheck(BaseCheck):
         rc, out, err = _run_certipy([
             "find",
             "-u", f"{self.env.cred.username}@{self.env.domain}",
-            "-p", self.env.cred.password,
+            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
         ])
@@ -506,7 +518,7 @@ class DcKdcCertificateCheck(BaseCheck):
             r = subprocess.run(
                 ["nxc", "ldap", self.env.dc_ip,
                  "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.domain,
                  "--module", "adcs"],
                 capture_output=True, text=True, timeout=20,

@@ -115,7 +115,9 @@ def _ldap_connect(env: TargetEnv):
 
 def _nxc_base_args(host: str, env: TargetEnv) -> list[str]:
     """Base nxc mssql args for authenticated queries."""
-    return [host, "-u", env.cred.username, "-p", env.cred.password, "-d", env.domain]
+    auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
+            else ["-p", env.cred.password])
+    return [host, "-u", env.cred.username, "-d", env.domain] + auth
 
 
 # ── individual checks ──────────────────────────────────────────────────────
@@ -465,7 +467,7 @@ class MssqlWebClientCheck(BaseCheck):
                 r = subprocess.run(
                     ["nxc", "smb", host,
                      "-u", self.env.cred.username,
-                     "-p", self.env.cred.password,
+                     *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                      "-d", self.env.domain,
                      "--module", "webdav"],
                     capture_output=True, text=True,
@@ -590,9 +592,19 @@ class MssqlSpnCheck(BaseCheck):
 
         # ── Method 1: impacket-GetUserSPNs ────────────────────────────────
         try:
+            if self.env.cred.nt_hash:
+                nh = self.env.cred.nt_hash.split(":")[-1]
+                spns_auth = [
+                    f"{self.env.domain}/{self.env.cred.username}",
+                    "-hashes", f"aad3b435b51404eeaad3b435b51404ee:{nh}",
+                ]
+            else:
+                spns_auth = [
+                    f"{self.env.domain}/{self.env.cred.username}:{self.env.cred.password}",
+                ]
             cmd = [
                 "impacket-GetUserSPNs",
-                f"{self.env.domain}/{self.env.cred.username}:{self.env.cred.password}",
+                *spns_auth,
                 "-dc-ip", self.env.dc_ip,
             ]
             r = subprocess.run(
@@ -809,7 +821,7 @@ class MssqlLoggedOnUsersCheck(BaseCheck):
             rc, out, err = _run_nxc_smb(
                 [host,
                  "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.domain,
                  "--loggedon-users"],
                 self.env,

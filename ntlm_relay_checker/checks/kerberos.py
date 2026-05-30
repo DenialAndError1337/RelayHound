@@ -139,7 +139,7 @@ class AdcsHttpEnrollmentCheck(BaseCheck):
         rc, out, err = _run_nxc(
             ["ldap", self.env.dc_ip,
              "-u", self.env.cred.username,
-             "-p", self.env.cred.password,
+             *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
              "-d", self.env.domain,
              "--module", "adcs"],
             self.env,
@@ -371,7 +371,7 @@ class CertificateTemplateCheck(BaseCheck):
         rc, out, err = _run_certipy([
             "find",
             "-u", f"{self.env.cred.username}@{self.env.domain}",
-            "-p", self.env.cred.password,
+            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
         ], timeout=45)
@@ -461,7 +461,7 @@ class KrbCoercionMethodCheck(BaseCheck):
             rc, out, err = _run_nxc(
                 ["smb", host,
                  "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.domain,
                  "--module", "spooler"],
                 self.env,
@@ -553,7 +553,7 @@ class DcTargetCheck(BaseCheck):
             rc, out, err = _run_nxc(
                 ["smb", host,
                  "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.domain],
                 self.env,
             )
@@ -617,7 +617,7 @@ class WebClientCoercionCheck(BaseCheck):
                 r = _sp.run(
                     ["nxc", "smb", host,
                      "-u", self.env.cred.username,
-                     "-p", self.env.cred.password,
+                     *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                      "-d", self.env.domain,
                      "--module", "webdav"],
                     capture_output=True, text=True,

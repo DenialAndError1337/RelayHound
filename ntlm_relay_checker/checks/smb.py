@@ -79,7 +79,7 @@ class SmbSigningCheck(BaseCheck):
         for target in targets:
             rc, out, err = _run_nxc(
                 ["smb", target, "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.cred.domain],
                 timeout=self.env.timeout + 10,
             )
@@ -140,7 +140,7 @@ class NtlmAuthEnabledCheck(BaseCheck):
         rc, out, err = _run_nxc(
             ["smb", self.env.dc_ip,
              "-u", self.env.cred.username,
-             "-p", self.env.cred.password,
+             *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
              "-d", self.env.cred.domain],
             timeout=self.env.timeout + 5,
         )

@@ -8,7 +8,7 @@ Automated tool to check whether a target Active Directory environment meets the 
 
 **RelayHound is a read-only reconnaissance tool. It does not perform any exploitation.**
 
-Note: RelayHound does make active network connections to target systems. It authenticates against SMB, LDAP, MSSQL and other services to enumerate their configuration. It will appear in authentication logs and generate network traffic.
+Note: RelayHound does make active network connections to target systems. It authenticates against SMB, LDAP, MSSQL and other services to enumerate their configuration. It will appear in authentication logs and generate network traffic. The underlying tools it calls (nxc, impacket, certipy, bloodyAD) have well-known network fingerprints and may trigger EDR, IDS, or SIEM alerts. The --delay and --jitter flags can spread out check timing, but do not obfuscate the traffic itself.
 
 All checks are read-only enumeration queries. No authentication is coerced, no tickets are relayed, no objects are modified, and no payloads are executed. Command suggestions shown in the output (e.g. `printerbug.py`, `ntlmrelayx.py`) are informational text only and are never run by the tool.
 
@@ -142,8 +142,9 @@ Target:
 
 Credentials:
   -u, --username            Domain username (low-privilege account)      [required]
-  -p, --password            Plaintext password         [required unless --nt-hash]
-  --nt-hash                 NT hash for pass-the-hash
+  -p, --password            Plaintext password         [required unless -H/--hashes]
+  -H, --hashes              NTLM hash for pass-the-hash (NT only or LM:NT format)
+                                                       [required unless -p/--password]
 
 Options:
   -v, --verbose             Show per-check details in terminal
@@ -151,7 +152,8 @@ Options:
   --modules LIST            Comma-separated list of module short names to run
                             (e.g. smb,rbcd,adcs). Invalid names print the full
                             list of valid aliases and exit.
-  --delay N                 Sleep N seconds between each attack module                                         (default: 0). Also randomises module execution order
+  --delay N                 Sleep N seconds between each attack module (default: 0).
+                            Also randomises module execution order
   --jitter N                Add up to N seconds of random variation to the delay
                             (default: 0). Requires --delay.
   --timeout N               Network timeout in seconds (default: 10)

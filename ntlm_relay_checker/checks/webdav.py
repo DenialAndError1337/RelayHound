@@ -51,7 +51,7 @@ def _run_nxc_smb_module(module: str, env: TargetEnv,
     return _run_nxc(
         ["smb", target,
          "-u", env.cred.username,
-         "-p", env.cred.password,
+         *((["-H", env.cred.nt_hash] if env.cred.nt_hash else ["-p", env.cred.password])),
          "-d", env.domain,
          "--module", module],
         env,
@@ -114,7 +114,7 @@ class WebClientServiceCheck(BaseCheck):
                 rc2, out2, err2 = _run_nxc(
                     ["smb", host,
                      "-u", self.env.cred.username,
-                     "-p", self.env.cred.password,
+                     *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                      "-d", self.env.domain,
                      "--services"],
                     self.env,
@@ -177,7 +177,7 @@ class SmbSigningBypassViaWebdavCheck(BaseCheck):
             rc, out, err = _run_nxc(
                 ["smb", host,
                  "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.domain],
                 self.env,
             )
@@ -224,7 +224,7 @@ class CoercionMethodCheck(BaseCheck):
             rc, out, err = _run_nxc(
                 ["smb", host,
                  "-u", self.env.cred.username,
-                 "-p", self.env.cred.password,
+                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                  "-d", self.env.domain,
                  "--module", "spooler"],
                 self.env,

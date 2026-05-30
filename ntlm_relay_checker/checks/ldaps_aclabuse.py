@@ -45,10 +45,11 @@ def _port_open(host: str, port: int, timeout: int = 5) -> bool:
 
 def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
     try:
+        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
+                else ["-p", env.cred.password])
         cmd = ["nxc", "ldap", env.dc_ip,
                "-u", env.cred.username,
-               "-p", env.cred.password,
-               "-d", env.domain] + args
+               "-d", env.domain] + auth + args
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
@@ -65,7 +66,7 @@ def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[i
 def _run_bloodyad(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
     try:
         cmd = ["bloodyAD", "--host", env.dc_ip, "-d", env.domain,
-               "-u", env.cred.username, "-p", env.cred.password] + args
+               "-u", env.cred.username, *((["-H", env.cred.nt_hash] if env.cred.nt_hash else ["-p", env.cred.password]))] + args
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:

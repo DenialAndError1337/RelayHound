@@ -75,7 +75,7 @@ Examples:
   python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --extra-targets 10.10.10.20,10.10.10.21 --attacker-ip 10.10.10.99 -v -o report.md
 
   # Pass-the-hash
-  python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv --nt-hash aad3b435b51404eeaad3b435b51404ee:HASH
+  python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -H aad3b435b51404eeaad3b435b51404ee:NTHASH
 
   # Find which accounts are worth coercing and for which attack
   python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --find-relay-targets
@@ -105,7 +105,7 @@ Examples:
     cred_exc = cred.add_mutually_exclusive_group(required=True)
     cred_exc.add_argument("-p", "--password", default=None,
                           help="Plaintext password")
-    cred_exc.add_argument("--nt-hash",   default=None,
+    cred_exc.add_argument("-H", "--hashes", dest="nt_hash", default=None,
                           help="NT hash for pass-the-hash (format: AABBCC...)")
 
     # Options

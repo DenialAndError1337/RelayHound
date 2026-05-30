@@ -34,10 +34,11 @@ except ImportError:
 
 def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
     try:
+        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
+                else ["-p", env.cred.password])
         cmd = ["nxc", "ldap", env.dc_ip,
                "-u", env.cred.username,
-               "-p", env.cred.password,
-               "-d", env.domain] + args
+               "-d", env.domain] + auth + args
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         return r.returncode, r.stdout, r.stderr
     except FileNotFoundError:
@@ -532,7 +533,12 @@ class LapsAclReadersCheck(BaseCheck):
                     "-action", "read",
                     "-target", computer,
                     "-dc-ip", self.env.dc_ip,
-                    f"{self.env.domain}/{self.env.cred.username}:{self.env.cred.password}",
+                    *((
+                        [f"{self.env.domain}/{self.env.cred.username}",
+                         "-hashes", f"aad3b435b51404eeaad3b435b51404ee:{self.env.cred.nt_hash.split(chr(58))[-1]}"]
+                        if self.env.cred.nt_hash
+                        else [f"{self.env.domain}/{self.env.cred.username}:{self.env.cred.password}"]
+                    )),
                 ],
                 capture_output=True, text=True, timeout=30,
             )
@@ -585,7 +591,7 @@ class LapsWebClientCoercionCheck(BaseCheck):
                     subprocess.run(
                         ["nxc", "smb", host,
                          "-u", self.env.cred.username,
-                         "-p", self.env.cred.password,
+                         *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
                          "-d", self.env.domain,
                          "--module", "webdav"],
                         capture_output=True, text=True,

@@ -162,10 +162,15 @@ def _ldap_connect(env: TargetEnv):
         return None
     try:
         server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
+        if env.cred.nt_hash:
+            nh = env.cred.nt_hash.split(":")[-1]
+            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
+        else:
+            auth_password = env.cred.password
         conn = Connection(
             server,
             user=env.cred.upn,
-            password=env.cred.password,
+            password=auth_password,
             authentication=NTLM,
             auto_bind=True,
         )
