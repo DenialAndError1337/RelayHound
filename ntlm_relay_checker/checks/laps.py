@@ -408,7 +408,8 @@ class LapsManagedComputersCheck(BaseCheck):
                 attributes=["sAMAccountName"],
             )
             count = len(conn.entries)
-            computers = [str(e["sAMAccountName"]) for e in conn.entries[:5]]
+            all_computers = [str(e["sAMAccountName"]) for e in conn.entries]
+            computers = all_computers[:5]
             conn.unbind()
 
             if count > 0:
@@ -419,6 +420,7 @@ class LapsManagedComputersCheck(BaseCheck):
                         f"{', '.join(computers)}{'...' if count > 5 else ''}. "
                         "Each managed computer has a unique local admin password."
                     ),
+                    raw="\n".join(all_computers),
                 )
             return CheckResult(
                 name=self.name, status=Status.FAIL,

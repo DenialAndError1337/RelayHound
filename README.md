@@ -116,7 +116,7 @@ The Recommended Attack Paths section is included in both the Markdown and HTML r
 
 When `--find-relay-targets` is passed, RelayHound performs an additional inbound ACL scan using your enumeration credential. It queries `nTSecurityDescriptor` on computer objects, the domain root, and high-value groups to find which principals have write (or read, for LAPS) rights over valuable AD objects.
 
-This takes a different angle from the rest of the tool. Rather than asking "can I relay _to_ X?", it asks "if I coerce account X into authenticating, which relay attack should I chain it with, and against which target object?" The output is a table of candidates — account, recommended attack, target object, and the specific right that makes it exploitable.
+This takes a different angle from the rest of the tool. Rather than asking "can I relay _to_ X?", it asks "if I coerce account X into authenticating, which relay attack should I chain it with, and against which target object?" The output is a table of candidates: account, recommended attack, target object, and the specific right that makes it exploitable.
 
 ```
 Relay Target Candidates
@@ -153,9 +153,13 @@ python relayhound.py [options]
 Target:
   -d, --domain              Target domain (e.g. sevenkingdoms.local)    [required]
   --dc-ip                   Primary Domain Controller IP                 [required]
+  --dc-ips                  Comma-separated IPs of additional known DCs (e.g. DCs
+                            in other domains/forests) so they rank as DC-level
+                            targets in attack paths
   --extra-targets           Comma-separated IPs, hostnames, CIDR ranges,
                             or dash ranges (e.g. 10.0.0.1,10.0.0.0/24,10.0.0.10-20)
-  --attacker-ip             Your Kali/attacker IP (for WebDAV relay check)
+  --attacker-ip             Your Kali/attacker IP — used to populate relay
+                            commands in the attack paths output
   --targets-file            File with target IPs/ranges, one per line (# for comments)
 
 Credentials:
@@ -168,7 +172,7 @@ Options:
   --parallel                Run attack checks in parallel (faster)
   --modules LIST            Comma-separated list of module short names to run
                             (e.g. smb,rbcd,adcs). Invalid names print the full
-                            list of valid aliases and exit. 
+                            list of valid aliases and exit.
   --delay N                 Sleep N seconds between each attack module (default: 0)
   --jitter N                Add up to N seconds of random variation to the delay
                             (default: 0). Requires --delay.
@@ -181,6 +185,8 @@ Options:
   --no-json                 Skip writing the JSON report
   --relay-list FILE         Save SMB unsigned hosts for ntlmrelayx -tf
   --no-relay-list           Skip writing the relay targets file
+  --laps-scope FILE         Save LAPS-managed computer names to this file
+  --no-laps-scope           Skip writing the LAPS scope file
   --find-relay-targets      Scan nTSecurityDescriptor ACLs to identify which
                             accounts are worth coercing and for which attack
 ```

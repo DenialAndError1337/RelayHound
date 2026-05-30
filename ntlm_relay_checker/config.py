@@ -46,6 +46,16 @@ class TargetEnv:
     # Whether to run the inbound ACL relay target finder (--find-relay-targets)
     find_relay_targets: bool = False
 
+    # All DC IPs discovered via LDAP at startup (populated by relayhound.py
+    # after env construction; falls back to [dc_ip] if discovery fails).
+    dc_ips: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Ensure dc_ips always contains at least the primary DC so modules
+        # can rely on it being non-empty before startup discovery runs.
+        if not self.dc_ips:
+            self.dc_ips = [self.dc_ip]
+
     # ── convenience helpers ─────────────────────────────────────────
 
     @property
@@ -53,6 +63,10 @@ class TargetEnv:
         """DC IP + any extra targets."""
         targets = [self.dc_ip] + self.extra_targets
         return list(dict.fromkeys(targets))   # deduplicate, preserve order
+
+    def dc_targets(self) -> list[str]:
+        """All discovered DC IPs (use for DC-specific checks)."""
+        return list(self.dc_ips)
 
     def smb_targets(self) -> list[str]:
         return self.all_targets

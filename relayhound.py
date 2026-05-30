@@ -26,6 +26,10 @@ from ntlm_relay_checker.engine import (
     run_checks_parallel,
     run_relay_target_finder,
 )
+from ntlm_relay_checker.startup import (
+    query_domain_controllers,
+    format_dc_discovery_line,
+)
 from ntlm_relay_checker.output import (
     CheckProgress,
     print_summary_table,
@@ -36,6 +40,7 @@ from ntlm_relay_checker.output import (
     write_html_report,
     write_json_report,
     write_relay_list,
+    write_laps_scope,
 )
 
 
@@ -82,6 +87,9 @@ Examples:
                      help="Target domain (e.g. corp.local)")
     tgt.add_argument("--dc-ip",          required=True,
                      help="Primary Domain Controller IP")
+    tgt.add_argument("--dc-ips",         default=None,
+                     help="Comma-separated IPs of additional known DCs (e.g. DCs in other "
+                          "domains/forests) so they rank as DC-level targets in attack paths")
     tgt.add_argument("--extra-targets",  default="",
                      help="Comma-separated IPs, hostnames, CIDR ranges, or dash ranges")
     tgt.add_argument("--attacker-ip",    default=None,
@@ -128,6 +136,10 @@ Examples:
                       help="Save SMB unsigned hosts to this file for ntlmrelayx -tf")
     opts.add_argument("--no-relay-list", action="store_true",
                       help="Skip writing the relay targets file")
+    opts.add_argument("--laps-scope",    default=None,
+                      help="Save LAPS-managed computer names to this file")
+    opts.add_argument("--no-laps-scope", action="store_true",
+                      help="Skip writing the LAPS scope file")
     opts.add_argument("--find-relay-targets", action="store_true",
                       help=(
                           "Scan nTSecurityDescriptor ACLs on computer objects, "
@@ -246,6 +258,25 @@ def main() -> int:
         find_relay_targets=args.find_relay_targets,
     )
 
+    # ── Seed dc_ips with any explicitly supplied DC IPs ───────────
+    if args.dc_ips:
+        extra_dcs = [ip.strip() for ip in args.dc_ips.split(",") if ip.strip()]
+        env.dc_ips = list(dict.fromkeys([env.dc_ip] + extra_dcs))
+
+    # ── Discover all DCs via LDAP ──────────────────────────────────
+    try:
+        from rich.console import Console as _C
+        _C().print("[dim]Querying domain for DC IPs...[/]", end="")
+    except ImportError:
+        print("[*] Querying domain for DC IPs...", end="")
+    discovered = query_domain_controllers(env)
+    env.dc_ips = list(dict.fromkeys(env.dc_ips + discovered))
+    try:
+        from rich.console import Console as _C
+        _C().print(f" [dim]found {len(env.dc_ips)}[/]")
+    except ImportError:
+        print(f" found {len(env.dc_ips)}")
+
     # ── Print run config ───────────────────────────────────────────
     try:
         from rich.console import Console
@@ -254,6 +285,7 @@ def main() -> int:
         c.print(Panel(
             f"[bold]Domain:[/]           [cyan]{env.domain}[/]\n"
             f"[bold]DC IP:[/]            [cyan]{env.dc_ip}[/]\n"
+            f"[bold]Domain Controllers:[/] [cyan]{format_dc_discovery_line(env.dc_ips, env.dc_ip)}[/]\n"
             f"[bold]User:[/]             [cyan]{cred.upn}[/]\n"
             f"[bold]Auth:[/]             {'NT hash' if cred.nt_hash else 'Password'}\n"
             f"[bold]Extra targets:[/]    {', '.join(extra) or 'none'}\n"
@@ -304,6 +336,7 @@ def main() -> int:
     env_summary = {
         "domain":        env.domain,
         "dc_ip":         env.dc_ip,
+        "dc_ips":        env.dc_ips,
         "user":          cred.upn,
         "attacker_ip":   env.attacker_ip,
         "extra_targets": extra,
@@ -377,6 +410,20 @@ def main() -> int:
                 )
             except ImportError:
                 print(f"[+] Relay targets saved: {relay_path} ({n} hosts)")
+
+    # ── Write LAPS scope file ──────────────────────────────────────
+    if not args.no_laps_scope:
+        laps_path = args.laps_scope or f"{args.domain.split('.')[0]}_laps_computers.txt"
+        n = write_laps_scope(results, laps_path)
+        if n > 0:
+            try:
+                from rich.console import Console
+                Console().print(
+                    f"[green]✓ LAPS scope saved:[/]       [bold]{laps_path}[/] "
+                    f"[dim]({n} managed computer{'s' if n != 1 else ''})[/]"
+                )
+            except ImportError:
+                print(f"[+] LAPS scope saved: {laps_path} ({n} computers)")
 
     viable = any(r.viability in ("VIABLE", "PARTIAL") for r in results)
     return 0 if viable else 1

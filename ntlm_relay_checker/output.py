@@ -89,6 +89,7 @@ def _build_attack_chains(
 
     # ── helpers ────────────────────────────────────────────────────
     dc_ip       = env_summary.get("dc_ip", "<dc-ip>")
+    dc_ips      = env_summary.get("dc_ips") or [dc_ip]
     domain      = env_summary.get("domain", "<domain>")
     attacker    = env_summary.get("attacker_ip") or "<attacker-ip>"
 
@@ -152,7 +153,12 @@ def _build_attack_chains(
         return []
 
     def _extract_unsigned_hosts(ar: "AttackResult | None") -> tuple[list[str], list[str]]:
-        """Return (dc_unsigned, non_dc_unsigned) from SMB check raw field."""
+        """Return (dc_unsigned, non_dc_unsigned) from SMB check raw field.
+
+        Uses dc_ips (all discovered DCs) rather than dc_ip alone so that
+        extra targets that are DCs in other domains are ranked correctly.
+        """
+        dc_set = set(dc_ips)
         if not ar:
             return [], []
         c = _get_check(ar, "SMB signing disabled")
@@ -163,13 +169,13 @@ def _build_attack_chains(
             # Fall back to parsing detail
             if c.detail:
                 hosts = re.findall(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", c.detail)
-                dc_u  = [h for h in hosts if h == dc_ip]
-                non_u = [h for h in hosts if h != dc_ip]
+                dc_u  = [h for h in hosts if h in dc_set]
+                non_u = [h for h in hosts if h not in dc_set]
                 return dc_u, non_u
             return [], []
         all_hosts = [h.strip().strip("'\" ") for h in m.group(1).split(",") if h.strip()]
-        dc_u  = [h for h in all_hosts if h == dc_ip]
-        non_u = [h for h in all_hosts if h != dc_ip]
+        dc_u  = [h for h in all_hosts if h in dc_set]
+        non_u = [h for h in all_hosts if h not in dc_set]
         return dc_u, non_u
 
     # Strip domain prefix from username for use in commands
@@ -1056,6 +1062,37 @@ def write_relay_list(results: list[AttackResult], output_path: str) -> int:
             f.write("\n".join(unsigned) + "\n")
 
     return len(unsigned)
+
+
+def write_laps_scope(results: list[AttackResult], output_path: str) -> int:
+    """
+    Write a list of LAPS-managed computer hostnames suitable for targeting
+    with ntlmrelayx --laps or a manual LDAP password dump.
+
+    Parses the raw field of LapsManagedComputersCheck (populated by the LAPS
+    module as a newline-separated list of sAMAccountNames).
+
+    Returns the number of computers written.
+    """
+    computers: list[str] = []
+
+    for ar in results:
+        if ar.attack_name != "NTLM Relay → LDAP (LAPS Password Dump)":
+            continue
+        for c in ar.checks:
+            if c.name == "LAPS-managed computers in scope (optional scope check)" and c.raw:
+                for line in c.raw.splitlines():
+                    host = line.strip()
+                    if host:
+                        computers.append(host)
+                break  # only one such check exists
+
+    if computers:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(computers) + "\n")
+
+    return len(computers)
+
 
 
 # ── Progress display ───────────────────────────────────────────────────────
