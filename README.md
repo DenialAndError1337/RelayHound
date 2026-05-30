@@ -393,18 +393,10 @@ ntlm_relay_checker/
 ## Notes
 
 - Designed for use with a **single low-privilege domain account**
-- All checks are **read-only**. No exploitation, no modifications
 - WARN/SKIP checks should be verified manually
 - Exit code: `0` if any attack is VIABLE/PARTIAL, `1` if none are viable
-- `--find-relay-targets` requires `impacket` for `nTSecurityDescriptor` ACE parsing
 
-## To Do List
-
-Fix pass-the-hash support — `--nt-hash` flag exists as an alternative to `-p` but the hash is not yet passed correctly to underlying tool calls. Currently falls back to empty password, causing checks to fail.
-
-```bash
-python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv --nt-hash <nthash>
-```
+---
 
 ### Legal Disclaimer
 
