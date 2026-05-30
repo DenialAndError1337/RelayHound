@@ -301,8 +301,8 @@ def main() -> int:
             f"[bold]Timeout:[/]          {env.timeout}s\n"
             f"[bold]Mode:[/]             {'parallel' if args.parallel else 'sequential'}\n"
             f"[bold]Modules:[/]          {args.modules or 'all'}\n"
-            f"[bold]Delay / jitter:[/]   {args.delay}s / {args.jitter}s\n"
-            f"[bold]Find relay targets:[/] {'yes' if args.find_relay_targets else 'no'}",
+            + (f"[bold]Delay / jitter:[/]   {args.delay}s / {args.jitter}s\n" if args.delay else "")
+            + f"[bold]Find relay targets:[/] {'yes' if args.find_relay_targets else 'no'}",
             title="Run Configuration",
             border_style="blue",
         ))

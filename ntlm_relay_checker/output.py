@@ -672,6 +672,12 @@ def _print_rich_verbose_details(results: list[AttackResult]) -> None:
     console = Console()
 
     console.print()
+    console.print(Panel.fit(
+        "[bold white]Per-Check Details[/]\n"
+        "[dim]Full check output for all attack modules[/]",
+        border_style="blue",
+    ))
+    console.print()
     dtbl = Table(
         box=box.SIMPLE_HEAD,
         show_header=True,
