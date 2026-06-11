@@ -12,8 +12,11 @@ Prerequisites:
   [REQ]  Domain functional level ≥ 2016 (msDS-KeyCredentialLink support)
   [REQ]  Writable computer/user object exists
          (write access to msDS-KeyCredentialLink)
-  [OPT]  ADCS present (needed for PKINIT/UnPAC-the-hash follow-up)
-         Not strictly required — can get TGT without ADCS if KDC supports PKINIT
+  [REQ]  DC has a KDC certificate (PKINIT must be functional for the relay
+         to yield anything usable — writing msDS-KeyCredentialLink without
+         a working PKINIT path produces no exploitable result)
+  [OPT]  ADCS present (needed for UnPAC-the-hash NT hash recovery;
+         not required — attack still yields a TGT without ADCS)
   [OPT]  WebClient running on target (HTTP coercion path via PetitPotam)
          Not needed for mitm6 or PrinterBug/PetitPotam RPC coercion
 """
@@ -500,15 +503,15 @@ class DcKdcCertificateCheck(BaseCheck):
                         "(1.3.6.1.5.2.3.5) using `certipy find -stdout`."
                     ),
                 )
-            if rc != -1 and "no certificate" not in lower:
-                # certipy ran but no CA found
+            else:
+                # certipy ran successfully but found no CA or KDC template
                 return CheckResult(
                     name=self.name, status=Status.FAIL,
                     detail=(
-                        "No ADCS found — DC may not have a KDC certificate. "
-                        "Without a KDC certificate, PKINIT will fail and Shadow Credentials "
-                        "cannot be used to obtain a TGT. "
-                        "Note: if the domain uses a third-party CA, check manually."
+                        "No ADCS or KDC certificate template found via certipy. "
+                        "Without a KDC certificate on the DC, PKINIT will fail and "
+                        "Shadow Credentials cannot be used to obtain a TGT. "
+                        "If a third-party CA is in use, verify manually."
                     ),
                 )
 
