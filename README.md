@@ -6,7 +6,7 @@ Automated tool to check whether a target Active Directory environment meets the 
 
 ## ⚠️ Scope and Intended Use
 
-**RelayHound is a read-only reconnaissance tool. It does not perform any exploitation.**
+**RelayHound is an active recon tool — it queries but never writes, relays, or coerces. It does not perform any exploitation.**
 
 Note: RelayHound does make active network connections to target systems. It authenticates against SMB, LDAP, MSSQL and other services to enumerate their configuration. It will appear in authentication logs and generate network traffic. The underlying tools it calls (nxc, impacket, certipy, bloodyAD) have well-known network fingerprints and may trigger EDR, IDS, or SIEM alerts. The --delay and --jitter flags can spread out check timing, but do not obfuscate the traffic itself.
 
