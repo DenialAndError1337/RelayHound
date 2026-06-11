@@ -193,8 +193,31 @@ def _build_attack_chains(
         non_u = [h for h in all_hosts if h not in dc_set]
         return dc_u, non_u
 
+    def _target_is_dc(computer_name: str) -> bool:
+        """
+        Return True if computer_name matches a known DC.
+
+        computer_name is the short name extracted from check details
+        (e.g. "KINGSLANDING", "WINTERFELL$" — dollar sign stripped).
+        Matched against:
+          - hmap values (IP → short hostname, populated at startup)
+          - dc_ips directly (in case the name is actually an IP)
+        Never uses hostname patterns — only cross-references known DC data.
+        """
+        if not computer_name:
+            return False
+        name = computer_name.rstrip("$").upper()
+        # Check against hostname map values
+        for ip, short in _hostname_map.items():
+            if ip in set(dc_ips) and short.upper() == name:
+                return True
+        # In case the caller passed an IP directly
+        if computer_name in set(dc_ips):
+            return True
+        return False
+
     # Strip domain prefix from username for use in commands
-    # env_summary["user"] is the full UPN e.g. "corp.local\lowpriv" — we want just "lowpriv"
+    # env_summary["user"] is the full UPN e.g. "corp.local\\lowpriv" — we want just "lowpriv"
     _raw_user = env_summary.get("user", "<user>")
     username  = _raw_user.split("\\")[-1] if "\\" in _raw_user else _raw_user
 
@@ -309,8 +332,16 @@ def _build_attack_chains(
         sc_computers = _extract_writable_computers(sc_ar, "Writable object")
         sc_target    = sc_computers[0] if sc_computers else "<target-computer>"
         adcs_present = _check_pass(sc_ar, "ADCS present")
+        # Tier escalates to CRITICAL when the writable object is a DC:
+        # DC machine account → PKINIT → UnPAC-the-hash → DCSync
+        sc_target_is_dc = _target_is_dc(sc_target)
+        sc_tier = "CRITICAL" if sc_target_is_dc else "HIGH"
+        sc_dc_note = (
+            " Target is a DC — PKINIT NT hash enables DCSync."
+            if sc_target_is_dc else ""
+        )
         chains.append(AttackChain(
-            tier="HIGH",
+            tier=sc_tier,
             title="Shadow Credentials → PKINIT → NT Hash",
             prereqs=(
                 f"LDAP relay viable + writable computer ({sc_target}) + KDC cert"
@@ -326,6 +357,7 @@ def _build_attack_chains(
                 "Writes msDS-KeyCredentialLink → PKINIT TGT for target machine account. "
                 + ("Then: PKINITtools getnthash.py → pass-the-hash." if adcs_present
                    else "ADCS not found — TGT obtained but NT hash recovery requires ADCS.")
+                + sc_dc_note
             ),
         ))
 
@@ -334,8 +366,16 @@ def _build_attack_chains(
     if _viable(rbcd_ar):
         rbcd_computers = _extract_writable_computers(rbcd_ar, "Writable computer")
         rbcd_target    = rbcd_computers[0] if rbcd_computers else "<target-computer>"
+        # Tier escalates to CRITICAL when the writable object is a DC:
+        # S4U2Self as any domain user to the DC → DCSync-equivalent access
+        rbcd_target_is_dc = _target_is_dc(rbcd_target)
+        rbcd_tier = "CRITICAL" if rbcd_target_is_dc else "HIGH"
+        rbcd_dc_note = (
+            " Target is a DC — S4U2Self as any domain user to DC enables DCSync-equivalent access."
+            if rbcd_target_is_dc else ""
+        )
         chains.append(AttackChain(
-            tier="HIGH",
+            tier=rbcd_tier,
             title="RBCD (Resource-Based Constrained Delegation)",
             prereqs=f"LDAP relay viable + writable computer ({rbcd_target}) + MAQ > 0",
             coerce_cmd=_coerce_cmd(dc_ip),
@@ -347,6 +387,7 @@ def _build_attack_chains(
                 f"Relay writes msDS-AllowedToActOnBehalfOfOtherIdentity on {rbcd_target}. "
                 "ntlmrelayx creates attacker machine account automatically. "
                 "Follow up: getST.py → pass-the-ticket → secretsdump."
+                + rbcd_dc_note
             ),
         ))
 

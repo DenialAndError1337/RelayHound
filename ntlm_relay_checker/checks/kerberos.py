@@ -540,14 +540,30 @@ class DcTargetCheck(BaseCheck):
 
     This check identifies whether any DC targets are in scope,
     which determines viability and which certificate template to use.
+
+    DC detection uses two attribute-based signals — never hostname patterns:
+
+      1. env.dc_ips membership — populated at startup via LDAP
+         SERVER_TRUST_ACCOUNT (UAC bit 0x2000) query; free, no extra call.
+
+      2. SMB ServerType flags — the SMB negotiate response carries
+         SV_TYPE_DOMAIN_CTRL (0x8) and SV_TYPE_DOMAIN_BAKCTRL (0x10),
+         which nxc surfaces as "(Domain Controller)" in its per-host output
+         line. This catches DCs in trusted domains / extra-targets that
+         startup LDAP discovery may not have reached.
+
+    Both signals are checked per host; either one is sufficient.
     """
 
     name = "DC target in scope (Forshaw trick most reliable against DCs)"
     required = False
 
     def _run(self) -> CheckResult:
-        dc_targets = []
-        member_targets = []
+        dc_targets: list[str] = []
+        member_targets: list[str] = []
+        unreachable: list[str] = []
+
+        known_dc_ips = set(self.env.dc_ips)
 
         for host in self.env.all_targets:
             rc, out, err = _run_nxc(
@@ -557,13 +573,23 @@ class DcTargetCheck(BaseCheck):
                  "-d", self.env.domain],
                 self.env,
             )
-            combined = out + err
-            lower = combined.lower()
+
             if rc == -1:
+                unreachable.append(host)
                 continue
-            # DCs show up with their domain name matching the DC hostname
-            # or can be identified by checking if host == dc_ip
-            if host == self.env.dc_ip:
+
+            # Signal 1: startup LDAP discovery already classified this IP
+            if host in known_dc_ips:
+                dc_targets.append(host)
+                continue
+
+            # Signal 2: SMB ServerType flags in nxc output
+            # nxc formats the host line as:
+            #   SMB  10.0.0.1  445  KINGSLANDING  [*] ... (domain) (Domain Controller)
+            # The "(Domain Controller)" label comes from SV_TYPE_DOMAIN_CTRL /
+            # SV_TYPE_DOMAIN_BAKCTRL in the SMB negotiate ServerType field —
+            # not from the hostname.
+            if "(domain controller)" in (out + err).lower():
                 dc_targets.append(host)
             else:
                 member_targets.append(host)
@@ -587,6 +613,15 @@ class DcTargetCheck(BaseCheck):
                     f"Only member server(s) in scope: {', '.join(member_targets)}. "
                     "Forshaw trick may produce NTLM rather than Kerberos against member servers. "
                     "Add the DC IP via --dc-ip or --extra-targets for reliable Kerberos relay."
+                ),
+            )
+
+        if unreachable:
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail=(
+                    f"nxc unreachable for all targets: {', '.join(unreachable)}. "
+                    "Install nxc or verify network connectivity."
                 ),
             )
 
