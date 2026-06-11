@@ -173,6 +173,12 @@ Options:
 
 ---
 
+## DC Discovery
+
+RelayHound automatically discovers Domain Controllers beyond the `--dc-ip` you specify, including DCs in child domains and other forest partitions. Discovered DCs are shown in the run config panel and check results, and are used throughout all checks to ensure targets are correctly identified as DCs, member servers, or workstations. Recommended attack paths use this to rank attacks against DCs as higher impact than the same attack against a member server or workstation. For most single-forest and parent/child domain topologies this requires no extra flags. `--dc-ips` is still available for edge cases where automatic discovery cannot reach a DC, such as a forest with no DNS connectivity from the attacker machine.
+
+---
+
 ## Attacks Checked
 
 ### 1. NTLM Relay → SMB (secretsdump)
