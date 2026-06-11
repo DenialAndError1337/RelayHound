@@ -13,6 +13,8 @@ Prerequisites:
   [REQ]  IF_ENFORCEENCRYPTICERTREQUEST flag NOT set on the CA
          (i.e. the CA does not require encrypted RPC connections)
   [REQ]  Request Disposition set to Issue (automatic certificate approval)
+  [REQ]  Enrollable certificate template with Client Authentication EKU exists
+         and grants enrollment rights to machine accounts or Domain Controllers
   [OPT]  certipy confirms ESC11 vulnerability
   [OPT]  SMB signing disabled on ≥1 target (to coerce relay via SMB)
   [OPT]  Coercible machine account exists in same domain as CA
@@ -360,6 +362,173 @@ class SmbSigningForCoercionCheck(BaseCheck):
 
 
 
+class EnrollableTemplateCheck(BaseCheck):
+    """
+    An enrollable certificate template with a suitable EKU must exist for
+    ESC11 to yield a usable certificate. The relay coerces a machine account
+    (typically a DC) to enroll via RPC — the template must:
+      - Be published on the CA (enabled)
+      - Allow machine account or Domain Controller enrollment
+      - Have Client Authentication EKU (1.3.6.1.5.5.7.3.2), Smart Card Logon,
+        Any Purpose (2.5.29.37.0), or no EKU (any purpose implied)
+
+    The DomainController and Machine templates satisfy all of these by default
+    and are present in every default ADCS deployment. This check matters because
+    templates can be disabled or deleted.
+
+    NOTE: duplicated from adcs.py — candidate for consolidation into utils.py.
+
+    Method: certipy find — look for templates with Client Authentication EKU
+            and enrollment rights for Domain Controllers or Domain Computers.
+            LDAP fallback: query pKIEnrollmentServices and pKICertificateTemplate
+            objects in the Configuration partition.
+    """
+
+    name = "Enrollable template with Client Authentication EKU exists"
+
+    AUTH_EKUS = {
+        "1.3.6.1.5.5.7.3.2",        # Client Authentication
+        "1.3.6.1.4.1.311.20.2.2",   # Smart Card Logon
+        "2.5.29.37.0",               # Any Purpose
+        "1.3.6.1.5.2.3.4",          # PKINIT Client Auth
+    }
+
+    def _run(self) -> CheckResult:
+        rc, out, err = _run_certipy([
+            "find",
+            "-u", f"{self.env.cred.username}@{self.env.domain}",
+            *(((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password]))),
+            "-dc-ip", self.env.dc_ip,
+            "-stdout",
+        ], timeout=45)
+
+        if rc != -1:
+            combined = out + err
+            lower = combined.lower()
+            suitable: list[str] = []
+            blocks = re.split(r"(?=Template Name\s*:)", combined, flags=re.IGNORECASE)
+            for block in blocks:
+                name_m = re.search(r"Template Name\s*:\s*([^\r\n]+)", block, re.IGNORECASE)
+                if not name_m:
+                    continue
+                tname = name_m.group(1).strip()
+
+                # Skip disabled templates
+                enabled_m = re.search(r"Enabled\s*:\s*(True|False)", block, re.IGNORECASE)
+                if enabled_m and enabled_m.group(1).strip().lower() == "false":
+                    continue
+
+                # Client Authentication field is authoritative — do NOT search
+                # the full block for "client authentication" as it appears in
+                # the field label even when the value is False
+                ca_m = re.search(r"Client Authentication\s*:\s*(True|False)", block, re.IGNORECASE)
+                has_client_auth = ca_m and ca_m.group(1).strip().lower() == "true"
+
+                # Scope EKU check to the Extended Key Usage section only
+                eku_m = re.search(r"Extended Key Usage\s*:(.*?)(?=\n\s{4}\w|\Z)", block, re.IGNORECASE | re.DOTALL)
+                eku_section = eku_m.group(1).lower() if eku_m else ""
+                has_auth_eku = has_client_auth or any(eku in eku_section for eku in [
+                    "smart card logon", "any purpose", "kdc authentication",
+                    "1.3.6.1.5.5.7.3.2", "2.5.29.37.0",
+                ])
+
+                block_lower = block.lower()
+                has_machine_enroll = any(term in block_lower for term in [
+                    "domain controllers", "domain computers",
+                    "enterprise domain controllers",
+                    "authenticated users", "domain users", "everyone",
+                ])
+                if has_auth_eku and has_machine_enroll:
+                    suitable.append(tname)
+
+            if suitable:
+                return CheckResult(
+                    name=self.name, status=Status.PASS,
+                    detail=(
+                        f"Suitable template(s) found: {', '.join(suitable[:3])}. "
+                        "Machine/DC enrollment with Client Authentication EKU available."
+                    ),
+                )
+            if "template name" in lower:
+                return CheckResult(
+                    name=self.name, status=Status.FAIL,
+                    detail=(
+                        "No certificate template found that allows machine/DC enrollment "
+                        "with Client Authentication EKU. "
+                        "ESC11 relay will not yield a usable certificate without a suitable template."
+                    ),
+                    raw=combined[:400],
+                )
+
+        # Fallback: LDAP query for published templates
+        try:
+            import ldap3
+            from ldap3 import Server, Connection, NTLM, SUBTREE
+            server = ldap3.Server(self.env.dc_ip, connect_timeout=self.env.timeout)
+            auth_pw = (
+                f"aad3b435b51404eeaad3b435b51404ee:{self.env.cred.nt_hash.split(':')[-1]}"
+                if self.env.cred.nt_hash else self.env.cred.password
+            )
+            conn = Connection(
+                server, user=self.env.cred.upn, password=auth_pw,
+                authentication=NTLM, auto_bind=True,
+            )
+            config_dn = "CN=Configuration," + ",".join(
+                f"DC={p}" for p in self.env.domain.split(".")
+            )
+            conn.search(
+                search_base=f"CN=Enrollment Services,CN=Public Key Services,CN=Services,{config_dn}",
+                search_filter="(objectClass=pKIEnrollmentService)",
+                search_scope=SUBTREE,
+                attributes=["certificateTemplates"],
+            )
+            published = set()
+            for entry in conn.entries:
+                for t in (entry["certificateTemplates"].values or []):
+                    published.add(str(t).lower())
+            if published:
+                conn.search(
+                    search_base=f"CN=Certificate Templates,CN=Public Key Services,CN=Services,{config_dn}",
+                    search_filter="(objectClass=pKICertificateTemplate)",
+                    search_scope=SUBTREE,
+                    attributes=["cn", "pKIExtendedKeyUsage"],
+                )
+                suitable_ldap = []
+                for entry in conn.entries:
+                    cn = str(entry["cn"]).lower()
+                    if cn not in published:
+                        continue
+                    ekus = [str(e) for e in (entry["pKIExtendedKeyUsage"].values or [])]
+                    if not ekus or any(e in self.AUTH_EKUS for e in ekus):
+                        suitable_ldap.append(str(entry["cn"]))
+                conn.unbind()
+                if suitable_ldap:
+                    return CheckResult(
+                        name=self.name, status=Status.PASS,
+                        detail=(
+                            f"Published template(s) with suitable EKU (via LDAP): "
+                            f"{', '.join(suitable_ldap[:3])}."
+                        ),
+                    )
+                return CheckResult(
+                    name=self.name, status=Status.FAIL,
+                    detail=(
+                        "No published template with Client Authentication EKU found via LDAP. "
+                        "ESC11 relay will not yield a usable certificate."
+                    ),
+                )
+        except Exception:
+            pass
+
+        return CheckResult(
+            name=self.name, status=Status.SKIP,
+            detail=(
+                "Could not enumerate certificate templates. "
+                "Install certipy-ad (pip install certipy-ad) for reliable template enumeration."
+            ),
+        )
+
+
 class RequestDispositionCheck(BaseCheck):
     """
     The CA must be configured to automatically issue certificates
@@ -443,6 +612,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         AdcsDeployedCheck(env),
         CaRpcReachableCheck(env),
         CaEncryptionFlagCheck(env),
+        EnrollableTemplateCheck(env),
         RequestDispositionCheck(env),
         Esc11CertipyCheck(env),
         SmbSigningForCoercionCheck(env),

