@@ -6,7 +6,7 @@ Automated tool to check whether a target Active Directory environment meets the 
 
 ## ⚠️ Scope and Intended Use
 
-**RelayHound is an active recon tool — it queries but never writes, relays, or coerces. It does not perform any exploitation.**
+**RelayHound is an active recon tool. It queries but never writes, relays, or coerces. It does not perform any exploitation.**
 
 Note: RelayHound does make active network connections to target systems. It authenticates against SMB, LDAP, MSSQL and other services to enumerate their configuration. It will appear in authentication logs and generate network traffic. The underlying tools it calls (nxc, impacket, certipy, bloodyAD) have well-known network fingerprints and may trigger EDR, IDS, or SIEM alerts. The --delay and --jitter flags can spread out check timing, but do not obfuscate the traffic itself.
 
@@ -42,13 +42,13 @@ This installs `ldap3`, `rich`, and `impacket`. Enough to run basic checks.
 **Optional tools** (recommended for full coverage):
 
 ```bash
-# netexec — SMB/LDAP/MSSQL checks
+# netexec: SMB/LDAP/MSSQL checks
 apt install netexec
 
-# certipy-ad — ADCS ESC8/ESC11 detection
+# certipy-ad: ADCS ESC8/ESC11 detection
 pip install certipy-ad
 
-# bloodyAD — LDAP ACL and object checks
+# bloodyAD: LDAP ACL and object checks
 pip install bloodyad
 ```
 
@@ -73,9 +73,17 @@ python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 
 # Run LDAP-based attacks only
 python relayhound.py -d north.sevenkingdoms.local --dc-ip 192.168.164.11 -u brandon.stark -p iseedeadpeople --modules rbcd,shadowcreds,laps,acl -v
 
-# Run ADCS-related modules only
-python relayhound.py -d sevenkingdoms.local --dc-ip 192.168.164.10 -u cersei.lannister -p il0vejaime --modules adcs,esc11,kerberos -v
+# Run all ADCS-related modules (ESC8 + ESC11 + Kerberos relay) using group alias
+python relayhound.py -d sevenkingdoms.local --dc-ip 192.168.164.10 -u cersei.lannister -p il0vejaime --modules adcs -v
+
+# Run all SCCM modules using group alias
+python relayhound.py -d sccm.lab --dc-ip 192.168.163.10 -u carol -p SCCMftw --extra-targets 192.168.163.11-13 --modules sccm -v 
+
+# Mix group aliases and individual modules
+python relayhound.py -d corp.local --dc-ip 10.10.10.1 -u lowpriv -p password123 --modules sccm,adcs,smb -v
 ```
+
+Group aliases expand to: `adcs` → ESC8 + ESC11 + Kerberos relay; `sccm` → TAKEOVER-1/2 + ELEVATE-2.
 
 ---
 
@@ -134,9 +142,9 @@ Target:
                             targets in attack paths
   --extra-targets           Comma-separated IPs, hostnames, CIDR ranges,
                             or dash ranges (e.g. 10.0.0.1,10.0.0.0/24,10.0.0.10-20)
-  --attacker-ip             Your Kali/attacker IP — used to populate
+  --attacker-ip             Your Kali/attacker IP. Used to populate
                             commands in the attack paths output
-  --attacker-hostname       Your Kali/attacker hostname — used to populate
+  --attacker-hostname       Your Kali/attacker hostname. Used to populate
                             commands in the attack paths output
   --targets-file            File with target IPs/ranges, one per line (# for comments)
 
@@ -211,7 +219,7 @@ Relay NTLM to LDAP to write `msDS-AllowedToActOnBehalfOfOtherIdentity` on a targ
 | MachineAccountQuota > 0 | ⚠️ Optional¹ | `nxc ldap --module maq` / ldap3 |
 | WebClient running on target | ⚠️ Optional | `nxc smb --module webdav` |
 
-¹ MAQ = 0 is a soft blocker — RBCD remains viable if you already control an existing machine account in the domain.
+¹ MAQ = 0 is a soft blocker. RBCD remains viable if you already control an existing machine account in the domain.
 
 **Exploit:** `ntlmrelayx.py -t ldaps://<dc> --delegate-access`
 
@@ -235,7 +243,7 @@ Relay NTLM to LDAP to write `msDS-KeyCredentialLink` on a target computer object
 
 ---
 
-### 4. NTLM Relay → ADCS (ESC8)
+#### 4. NTLM Relay → ADCS (ESC8)
 
 Relay to AD CS web enrollment (certsrv) over HTTP. Allows enrolling a certificate on behalf of the relayed account.
 
@@ -248,6 +256,7 @@ Relay to AD CS web enrollment (certsrv) over HTTP. Allows enrolling a certificat
 | CA Request Disposition set to Issue | ✅ | certipy `Request Disposition` field |
 | certipy confirms ESC8 | ⚠️ Optional | `certipy-ad find -vulnerable` |
 | HTTPS certsrv EPA not enforced | ⚠️ Optional | Manual registry check |
+| SMB coercion methods available | ⚠️ Optional | `nxc smb --module coerce_plus` (PrinterBug, PetitPotam, DFSCoerce, ShadowCoerce, MSEven) |
 
 **Exploit:** `ntlmrelayx.py -t http://<ca>/certsrv/certfnsh.asp --adcs --template DomainController`
 
@@ -265,6 +274,7 @@ Relay NTLM over RPC to the ICPR interface on the CA server, bypassing the need f
 | Enrollable template with Client Authentication EKU | ✅ | certipy / ldap3 `pKIExtendedKeyUsage` |
 | CA Request Disposition set to Issue | ✅ | certipy `Request Disposition` field |
 | certipy confirms ESC11 | ⚠️ Optional | `certipy-ad find -vulnerable` |
+| SMB coercion methods available | ⚠️ Optional | `nxc smb --module coerce_plus` (PrinterBug, PetitPotam, DFSCoerce, ShadowCoerce, MSEven) |
 
 **Exploit:** `ntlmrelayx.py -t rpc://<ca-host> -rpc-mode ICPR -icpr-ca-name '<ca-name>' --template DomainController`
 
@@ -305,14 +315,28 @@ Coerce a Windows machine to authenticate via WebDAV (HTTP + NTLM), bypassing SMB
 
 ### 8. Kerberos Relay → ADCS (krbrelayx + Forshaw DNS)
 
-Relay Kerberos authentication to ADCS using krbrelayx, combined with Forshaw's DNS trick to direct coercion to the attacker.
+Relay Kerberos authentication to ADCS using krbrelayx. Three coercion paths are supported. ADIDNS write access is only required for path 1.
 
-| Check                                  | Required    | Method             |
+**Path 1 — Forshaw DNS trick:** Add a Forshaw-encoded ADIDNS record pointing to attacker, coerce DC auth to that hostname.
+
+**Path 2 — mitm6 / DHCPv6 poisoning:** Poison DHCPv6 DNS to intercept Kerberos auth. No ADIDNS write needed. Unreliable when ADCS and DC are on the same host.
+
+**Path 3 — Kerberos relay over SMB:** Pass the Forshaw-encoded string directly as the coercion target argument. No DNS record registration needed.
+
+| Check | Required | Method |
 | -------------------------------------- | ----------- | ------------------ |
-| AD CS deployed with HTTP enrollment    | ✅           | certipy / ldap3    |
-| DNS update rights (for Forshaw trick)  | ✅           | `dnstool.py` check |
-| Unconstrained delegation target exists | ⚠️ Optional | ldap3              |
-| ADCS template allows client auth       | ⚠️ Optional | certipy            |
+| AD CS deployed with HTTP enrollment | ✅ | certipy / ldap3 |
+| certsrv accepts Kerberos auth | ✅ | `WWW-Authenticate: Negotiate` header |
+| DomainController / Machine template available | ✅ | certipy |
+| HOST SPN set on target machine account | ✅ | ldap3 |
+| ADIDNS writable by domain user | ⚠️ Optional¹ | ldap3 DNS zone query |
+| Coercion method available (PrinterBug / PetitPotam) | ⚠️ Optional | `nxc smb --module spooler` / RPC port check |
+| SMB coercion methods available | ⚠️ Optional | `nxc smb --module coerce_plus` |
+| WebClient running on target | ⚠️ Optional | `nxc smb --module webdav` |
+| DCOM/RPC reachable on target | ⚠️ Optional | TCP port 135 check |
+| DC target in scope | ⚠️ Optional | DC classification |
+
+¹ Required for path 1 (Forshaw DNS trick) only. Paths 2 and 3 do not require ADIDNS write access.
 
 **Exploit:** `krbrelayx.py --target http://<ca>/certsrv/`
 
@@ -361,13 +385,62 @@ Relay NTLM to LDAPS to modify ACLs on AD objects — granting DCSync rights, add
 
 ---
 
+### 12. NTLM Relay → SCCM (TAKEOVER-1 / TAKEOVER-2)
+
+Coerce NTLM authentication from the SCCM site server machine account and relay it to the remote site database. The site server's machine account has `db_owner` on the site database by default, which allows granting any domain account the SCCM "Full Administrator" role — giving arbitrary code execution on all managed SCCM clients as SYSTEM.
+
+Two relay paths to the same outcome:
+- **TAKEOVER-1:** Relay to MSSQL (TCP 1433) on the site database server
+- **TAKEOVER-2:** Relay to SMB (TCP 445) on the site database server (requires SMB signing disabled)
+
+Valid coercion targets: primary site server (TAKEOVER-x.1), SMS Provider if on separate host (TAKEOVER-x.2), passive site server in HA deployments (TAKEOVER-x.3).
+
+| Check | Required | Method |
+|-------|----------|--------|
+| SCCM detected in AD | ✅ | ldap3 — System Management container + GenericAll ACE |
+| Site server identifiable and reachable | ✅ | ldap3 + TCP port check (445/135) |
+| Site database on separate host from site server | ✅ | ldap3 hostname comparison |
+| At least one relay path viable (MSSQL or SMB) | ✅ | TCP 1433 + SMB signing check |
+| Site DB MSSQL reachable and accepts NTLM | ⚠️ Optional | TCP 1433 + `nxc mssql` |
+| SMB signing disabled on site DB | ⚠️ Optional | `nxc smb` signing check |
+| Coercion available on site server / SMS Provider | ⚠️ Optional | `nxc smb --module spooler` / RPC port 135 |
+| MSSQL EPA not enforced | ⚠️ Optional | TCP 1433 reachable (EPA not remotely verifiable) |
+
+Site database hostname is discovered automatically via MSSQLSvc SPN lookup in AD (no additional tools required).
+
+**Exploit (TAKEOVER-1):** `ntlmrelayx.py -t mssql://<site-db> -socks -smb2support`
+
+**Exploit (TAKEOVER-2):** `ntlmrelayx.py -t smb://<site-db> -socks -smb2support`
+
+---
+
+### 13. NTLM Relay → SCCM (ELEVATE-2)
+
+Trigger SCCM's automatic client push installation to coerce NTLM authentication from the site server's push installation accounts (or machine account as fallback), then relay to a target. Client push accounts typically have local admin across all managed clients. If the push account is a Domain Admin or falls back to the site server machine account, impact escalates to TAKEOVER-1/2 territory.
+
+Coercion mechanism: register a fake device via the management point using SharpSCCM (`invoke client-push`). No Linux equivalent exists — must be run from a Windows host.
+
+| Check | Required | Method |
+|-------|----------|--------|
+| Management point reachable (HTTP/HTTPS) | ✅ | TCP port 80/443 check |
+| Automatic client push + NTLM fallback enabled | ⚠️ Optional¹ | Not remotely detectable |
+| Unsigned SMB relay targets available (ELEVATE-2.1) | ⚠️ Optional | `nxc smb` signing check |
+| ADIDNS writable by domain user (ELEVATE-2.2 HTTP) | ⚠️ Optional | ldap3 DNS zone query |
+| WebClient running on site server | ⚠️ Optional | `nxc smb --module webdav` |
+
+¹ Automatic client push installation, automatic site assignment, and NTLM fallback cannot be confirmed remotely — only visible in the SCCM console or by attempting the attack. Both are enabled by default in most deployments.
+
+**Exploit:** `SharpSCCM.exe invoke client-push -mp <mp-host> -sc <site-code> -t <attacker-ip>`
+
+---
+
 ## External Tools Used
 
 The checker calls these tools if installed. Gracefully falls back or skips if not found.
 
 | Tool | Install | Used for |
 |------|---------|----------|
-| `nxc` / `netexec` | `apt install netexec` | SMB/LDAP/MSSQL/WebDAV checks |
+| `nxc` / `netexec` | `apt install netexec` | SMB/LDAP/MSSQL/WebDAV checks, `coerce_plus` coercion detection |
 | `certipy-ad` | `pip install certipy-ad` | ADCS ESC8/ESC11 detection |
 | `bloodyAD` | `pip install bloodyad` | LDAP ACL/object checks |
 | `impacket-GetUserSPNs` | pre-installed on Kali | MSSQL SPN enumeration |
@@ -387,6 +460,8 @@ ntlm_relay_checker/
 │                                run_relay_target_finder()
 ├── output.py                    Rich terminal table, Markdown + HTML reports,
 │                                relay target summary renderer
+├── utils.py                     Shared helpers and reusable check classes
+│                                (CoercionAvailabilityCheck, future consolidation)
 └── checks/
     ├── base.py                  BaseCheck, CheckResult, AttackResult, Status
     ├── smb.py                   NTLM Relay → SMB
@@ -400,6 +475,8 @@ ntlm_relay_checker/
     ├── laps.py                  NTLM Relay → LDAP (LAPS)
     ├── ldaps_addcomputer.py     NTLM Relay → LDAPS (Add Computer)
     ├── ldaps_aclabuse.py        NTLM Relay → LDAPS (ACL Abuse)
+    ├── sccm_takeover.py         NTLM Relay → SCCM (TAKEOVER-1/2)
+    ├── sccm_elevate2.py         NTLM Relay → SCCM (ELEVATE-2)
     └── relay_target_finder.py   Inbound ACL scan (--find-relay-targets)
 ```
 

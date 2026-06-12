@@ -24,6 +24,7 @@ import urllib.error
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 from .esc11 import RequestDispositionCheck
+from ..utils import CoercionAvailabilityCheck
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -642,6 +643,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         RequestDispositionCheck(env),
         ESC8CertipyCheck(env),
         HttpsEpaCheck(env),
+        CoercionAvailabilityCheck(env),
     ]
 
 ATTACK_NAME = "NTLM Relay → ADCS (ESC8)"

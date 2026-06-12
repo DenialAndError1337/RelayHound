@@ -30,6 +30,7 @@ import subprocess
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
+from ..utils import CoercionAvailabilityCheck
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -616,6 +617,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         RequestDispositionCheck(env),
         Esc11CertipyCheck(env),
         SmbSigningForCoercionCheck(env),
+        CoercionAvailabilityCheck(env),
     ]
 
 ATTACK_NAME = "NTLM Relay → ADCS (ESC11 / RPC)"

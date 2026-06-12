@@ -9,22 +9,36 @@ Key distinction from NTLM relay:
   - Kerberos CANNOT relay to LDAP (integrity flag forces signing)
   - Kerberos CAN relay to ADCS HTTP (no signing requirement)
   - SMB signing is irrelevant — this is not an SMB relay
-  - The Forshaw DNS encoding trick forces Kerberos (not NTLM) auth from target
 
-Attack flow (remote from Kali, PetitPotam/PrinterBug coercion):
-  1. Add Forshaw-encoded ADIDNS record pointing to attacker IP
-     (requires only a regular domain user account)
-  2. Start krbrelayx targeting ADCS HTTP endpoint
-  3. Coerce DC machine account auth via PetitPotam/PrinterBug
-     using the Forshaw hostname — Windows requests Kerberos DNS ticket
-  4. krbrelayx relays ticket to certsrv → certificate issued for DC$
-  5. certipy auth → PKINIT → NT hash recovered (UnPAC-the-hash)
-  6. DCSync → full domain compromise
+Three supported coercion paths (ADIDNS write only required for path 1):
+
+  Path 1 — Forshaw DNS trick (coerce → ADIDNS record → krbrelayx):
+    1. Add Forshaw-encoded ADIDNS record pointing to attacker IP
+       (requires only a regular domain user account)
+    2. Start krbrelayx targeting ADCS HTTP endpoint
+    3. Coerce DC via PetitPotam/PrinterBug using the Forshaw hostname
+       — Windows requests Kerberos DNS ticket for that name
+    4. krbrelayx relays ticket to certsrv → certificate issued for DC$
+
+  Path 2 — mitm6 / DHCPv6 DNS poisoning (no ADIDNS write needed):
+    1. Start mitm6 to poison DHCPv6 DNS for target hosts
+    2. Victim machine authenticates via Kerberos to attacker DNS name
+    3. krbrelayx relays to ADCS HTTP endpoint
+    Note: unreliable when ADCS and DC are on the same host
+
+  Path 3 — Kerberos relay over SMB (Synacktiv technique, no ADIDNS write):
+    1. Pass the Forshaw-encoded string directly as the coercion target
+       hostname argument — no DNS record registration needed
+    2. Coerce DC auth to the marshalled hostname string
+    3. krbrelayx relays to ADCS HTTP endpoint
+
+  All paths end with:
+    certipy auth → PKINIT → NT hash recovered (UnPAC-the-hash) → DCSync
 
 Prerequisites:
   [REQ]  ADCS deployed with HTTP enrollment enabled (certsrv reachable)
   [REQ]  certsrv accepts Negotiate/Kerberos auth (WWW-Authenticate: Negotiate)
-  [REQ]  ADIDNS record writable by domain user (default: yes)
+  [OPT]  ADIDNS record writable by domain user — required for path 1 only
   [REQ]  DomainController or Machine certificate template available
   [OPT]  Coercion method available (PrinterBug / PetitPotam)
   [OPT]  DCOM/RPC reachable on target (port 135) for coercion
@@ -32,7 +46,6 @@ Prerequisites:
          member servers may fall back to NTLM)
 
 Notes:
-  - mitm6 is unreliable when ADCS and DC are on the same host
   - Cross-domain relay (child domain machine → parent CA) requires
     the CA template to grant enrollment rights to the child domain
   - Always clean up: remove Forshaw DNS record and clear
@@ -47,6 +60,7 @@ import urllib.error
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
+from ..utils import CoercionAvailabilityCheck
 
 try:
     import ldap3
@@ -270,19 +284,20 @@ class CertsrvKerberosAuthCheck(BaseCheck):
 
 class AdidnsWritableCheck(BaseCheck):
     """
-    The Forshaw DNS encoding trick requires adding an ADIDNS (AD-integrated DNS)
-    record pointing to the attacker. By default, any authenticated domain user
-    can add DNS records to the domain zone via LDAP.
+    The Forshaw DNS trick (coercion path 1) requires adding an ADIDNS record
+    pointing to the attacker. By default, any authenticated domain user can
+    add DNS records to the domain zone via LDAP.
 
-    Method: check if the domain DNS zone is writable by querying
-    the ACL on the MicrosoftDNS container — or attempt a lightweight
-    ldap3 bind to confirm domain user auth works (write access is default).
+    This check is required=False because ADIDNS write is only needed for
+    path 1 (Forshaw DNS trick). Paths 2 (mitm6) and 3 (Kerberos relay over
+    SMB / marshalled hostname in coercion argument) do not require it.
 
-    In practice this is enabled by default in AD environments, so we check
-    for the uncommon case where it's been locked down.
+    In practice ADIDNS write is enabled by default, so we check for the
+    uncommon case where it has been locked down.
     """
 
-    name = "ADIDNS record writable by domain user (Forshaw DNS trick)"
+    name = "ADIDNS record writable by domain user (Forshaw DNS path only)"
+    required = False
 
     def _run(self) -> CheckResult:
         # The most reliable check is to confirm authenticated LDAP access works
@@ -310,7 +325,6 @@ class AdidnsWritableCheck(BaseCheck):
                 auto_bind=True,
             )
             if conn.bound:
-                # Check that the DNS zone container exists and is accessible
                 domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
                 dns_zone_dn = (
                     f"DC={self.env.domain},"
@@ -328,7 +342,7 @@ class AdidnsWritableCheck(BaseCheck):
                     detail=(
                         "LDAP bind succeeded and DNS zone accessible. "
                         "By default, authenticated domain users can add ADIDNS records — "
-                        "Forshaw DNS trick viable. "
+                        "Forshaw DNS trick (path 1) viable. "
                         "Command: `dnstool.py -u '<domain>\\<user>' -p '<pass>' "
                         "-r '<forshaw_hostname>' -a add -d <attacker_ip> -t A --tcp <dc_ip>`"
                     ),
@@ -340,7 +354,9 @@ class AdidnsWritableCheck(BaseCheck):
                     name=self.name, status=Status.FAIL,
                     detail=(
                         f"LDAP access denied — DNS zone may be write-protected: {e}. "
-                        "Forshaw DNS trick may not be possible with this account."
+                        "Forshaw DNS trick (path 1) not viable with this account. "
+                        "mitm6 (path 2) and SMB coercion with marshalled hostname (path 3) "
+                        "are unaffected and do not require ADIDNS write access."
                     ),
                 )
             return CheckResult(
@@ -350,7 +366,11 @@ class AdidnsWritableCheck(BaseCheck):
 
         return CheckResult(
             name=self.name, status=Status.WARN,
-            detail="DNS zone not found at expected path. Verify ADIDNS configuration manually.",
+            detail=(
+                "DNS zone not found at expected path. Verify ADIDNS configuration manually. "
+                "mitm6 (path 2) and SMB coercion with marshalled hostname (path 3) "
+                "do not require ADIDNS write access."
+            ),
         )
 
 
@@ -429,7 +449,7 @@ class CertificateTemplateCheck(BaseCheck):
             detail=(
                 "Could not confirm template availability from certipy output. "
                 "DomainController and Machine templates are present by default — "
-                "verify manually if certipy output is unexpected.",
+                "verify manually if certipy output is unexpected."
             ),
             raw=combined[:400],
         )
@@ -779,6 +799,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         DcomRpcReachableCheck(env),
         DcTargetCheck(env),
         WebClientCoercionCheck(env),
+        CoercionAvailabilityCheck(env),
     ]
 
 ATTACK_NAME = "Kerberos Relay → ADCS (krbrelayx + Forshaw DNS)"

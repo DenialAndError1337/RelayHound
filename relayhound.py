@@ -219,21 +219,37 @@ def main() -> int:
         "rbcd":          1,
         "shadowcreds":   2,
         "adcs":          3,
-        "mssql":         4,
-        "webdav":        5,
-        "kerberos":      6,
-        "esc11":         7,
+        "esc11":         4,
+        "mssql":         5,
+        "webdav":        6,
+        "kerberos":      7,
         "laps":          8,
         "addcomputer":   9,
         "acl":          10,
+        "sccm_takeover": 11,
+        "sccm_elevate2": 12,
+    }
+
+    # Group aliases: expand to multiple module names before MODULE_ALIASES lookup
+    GROUP_ALIASES: dict[str, list[str]] = {
+        "sccm":  ["sccm_takeover", "sccm_elevate2"],
+        "adcs":  ["adcs", "esc11", "kerberos"],
     }
 
     if args.modules:
-        requested = [m.strip().lower() for m in args.modules.split(",") if m.strip()]
+        requested_raw = [m.strip().lower() for m in args.modules.split(",") if m.strip()]
+        # Expand group aliases first
+        requested: list[str] = []
+        for m in requested_raw:
+            if m in GROUP_ALIASES:
+                requested.extend(GROUP_ALIASES[m])
+            else:
+                requested.append(m)
         invalid = [m for m in requested if m not in MODULE_ALIASES]
         if invalid:
             print(f"[!] Unknown module(s): {', '.join(invalid)}")
-            print(f"    Valid names: {', '.join(MODULE_ALIASES)}")
+            print(f"    Valid names:  {', '.join(MODULE_ALIASES)}")
+            print(f"    Group aliases: {', '.join(GROUP_ALIASES)}")
             return 1
         # Keep canonical order regardless of input order
         selected_indices = sorted(set(MODULE_ALIASES[m] for m in requested))
