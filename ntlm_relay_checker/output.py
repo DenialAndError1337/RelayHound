@@ -1543,7 +1543,7 @@ def write_html_report(
   tr:hover td {{ background: #1a1f2e; }}
   .center {{ text-align: center; }}
   .attack-name {{ font-weight: 500; white-space: nowrap; }}
-  .detail-cell {{ color: #a0aec0; font-size: 12px; max-width: 420px; }}
+  .detail-cell {{ color: #a0aec0; font-size: 12px; }}
 
   /* ── Row colours by status ── */
   .row-pass td  {{ border-left: 2px solid #48bb78; }}
@@ -1613,6 +1613,15 @@ def write_html_report(
     margin: 4px 0 0 16px;
   }}
   .checks-table td, .checks-table th {{ padding: 8px 14px; }}
+  .checks-table {{ table-layout: fixed; }}
+  .checks-table th:nth-child(1),
+  .checks-table td:nth-child(1) {{ width: 38%; word-break: break-word; }}
+  .checks-table th:nth-child(2),
+  .checks-table td:nth-child(2) {{ width: 90px; text-align: center; white-space: nowrap; }}
+  .checks-table th:nth-child(3),
+  .checks-table td:nth-child(3) {{ width: 90px; text-align: center; white-space: nowrap; }}
+  .checks-table th:nth-child(4),
+  .checks-table td:nth-child(4) {{ width: auto; }}
 
   /* ── Summary table wrapper ── */
   .summary-wrapper {{

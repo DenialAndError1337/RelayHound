@@ -9,8 +9,8 @@ target service via S4U2Self + S4U2Proxy.
 Prerequisites:
   [REQ]  LDAP signing not enforced
   [REQ]  LDAP channel binding not required
-  [REQ]  Domain functional level ≥ 2012 R2 (msDS-AllowedToActOnBehalfOfOtherIdentity
-         was introduced in Windows Server 2012 R2 / DFL 6)
+  [REQ]  Domain functional level ≥ 2012 (msDS-AllowedToActOnBehalfOfOtherIdentity
+         was introduced in Windows Server 2012 / DFL 5)
   [REQ]  Writable computer object exists — the RBCD target; relay writes
          msDS-AllowedToActOnBehalfOfOtherIdentity on this object
   [REQ*] MachineAccountQuota > 0 — needed to create the attacker-controlled
@@ -180,10 +180,10 @@ class LdapChannelBindingCheck(BaseCheck):
 
 class DomainFunctionalLevelCheck(BaseCheck):
     """
-    RBCD requires DFL ≥ 6 (Windows Server 2012 R2).
-    The msDS-AllowedToActOnBehalfOfOtherIdentity attribute was introduced
-    in 2012 R2. Below this level the attribute does not exist and relay
-    will fail silently.
+    RBCD requires DFL ≥ 5 (Windows Server 2012).
+    msDS-AllowedToActOnBehalfOfOtherIdentity was introduced in Windows
+    Server 2012 (not 2012 R2 — DFL 5 is sufficient). Below this level
+    the attribute does not exist and relay will fail silently.
 
     Old environments (DFL 2008 or lower) are encountered in practice —
     do not assume this check will always pass.
@@ -191,7 +191,7 @@ class DomainFunctionalLevelCheck(BaseCheck):
     Method: ldap3 query msDS-Behavior-Version on domain root.
     """
 
-    name = "Domain functional level ≥ 2012 R2 (RBCD support)"
+    name = "Domain functional level ≥ 2012 (RBCD support)"
 
     DFL_NAMES = {
         0: "2000", 1: "2003 Mixed", 2: "2003", 3: "2008",
@@ -217,7 +217,7 @@ class DomainFunctionalLevelCheck(BaseCheck):
             if conn.entries:
                 dfl = int(conn.entries[0]["msDS-Behavior-Version"].value or 0)
                 dfl_name = self.DFL_NAMES.get(dfl, f"unknown ({dfl})")
-                if dfl >= 6:
+                if dfl >= 5:
                     return CheckResult(
                         name=self.name, status=Status.PASS,
                         detail=(
@@ -229,7 +229,7 @@ class DomainFunctionalLevelCheck(BaseCheck):
                     name=self.name, status=Status.FAIL,
                     detail=(
                         f"DFL = {dfl} (Windows Server {dfl_name}). "
-                        "RBCD requires DFL ≥ 6 (2012 R2). "
+                        "RBCD requires DFL ≥ 5 (Windows Server 2012). "
                         "msDS-AllowedToActOnBehalfOfOtherIdentity attribute not available at this level."
                     ),
                 )

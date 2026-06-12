@@ -181,6 +181,13 @@ Options:
 
 ---
 
+## HTML Report
+
+RelayHound generates an HTML report alongside the Markdown output.
+The report includes a **Remediation Recommendations** section, making it useful for blue teamers and defenders.
+
+---
+
 ## DC Discovery
 
 RelayHound automatically discovers Domain Controllers beyond the `--dc-ip` you specify, including DCs in child domains and other forest partitions. Discovered DCs are shown in the run config panel and check results, and are used throughout all checks to ensure targets are correctly identified as DCs, member servers, or workstations. Recommended attack paths use this to rank attacks against DCs as higher impact than the same attack against a member server or workstation. For most single-forest and parent/child domain topologies this requires no extra flags. `--dc-ips` is still available for edge cases where automatic discovery cannot reach a DC.
@@ -214,7 +221,7 @@ Relay NTLM to LDAP to write `msDS-AllowedToActOnBehalfOfOtherIdentity` on a targ
 |-------|----------|--------|
 | LDAP signing not enforced | ✅ | `nxc ldap --module ldap-checker` |
 | LDAP channel binding not required | ✅ | `nxc ldap --module ldap-checker` |
-| Domain functional level ≥ 2012 R2 (RBCD support) | ✅ | ldap3 `msDS-Behavior-Version` |
+| Domain functional level ≥ 2012 (RBCD support) | ✅ | ldap3 `msDS-Behavior-Version` |
 | Writable computer object exists | ✅ | `bloodyAD get writable --otype COMPUTER` |
 | MachineAccountQuota > 0 | ⚠️ Optional¹ | `nxc ldap --module maq` / ldap3 |
 | WebClient running on target | ⚠️ Optional | `nxc smb --module webdav` |
