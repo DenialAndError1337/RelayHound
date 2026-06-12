@@ -17,13 +17,12 @@ ATTACK_MODULES = [
     ("ntlm_relay_checker.checks.adcs",               "NTLM Relay → ADCS (ESC8)"),              # 3  adcs
     ("ntlm_relay_checker.checks.esc11",              "NTLM Relay → ADCS (ESC11 / RPC)"),       # 4  esc11
     ("ntlm_relay_checker.checks.mssql",              "NTLM Relay → MSSQL"),                    # 5  mssql
-    ("ntlm_relay_checker.checks.webdav",             "NTLM Relay → HTTP/WebDAV"),              # 6  webdav
-    ("ntlm_relay_checker.checks.kerberos",           "Kerberos Relay → ADCS (krbrelayx + Forshaw DNS)"), # 7  kerberos
-    ("ntlm_relay_checker.checks.laps",               "NTLM Relay → LDAP (LAPS Password Dump)"),# 8  laps
-    ("ntlm_relay_checker.checks.ldaps_addcomputer",  "NTLM Relay → LDAPS (Add Computer Account)"), # 9  addcomputer
-    ("ntlm_relay_checker.checks.ldaps_aclabuse",     "NTLM Relay → LDAPS (ACL Abuse)"),        # 10 acl
-    ("ntlm_relay_checker.checks.sccm_takeover",      "NTLM Relay → SCCM (TAKEOVER-1/2)"),      # 11 sccm_takeover
-    ("ntlm_relay_checker.checks.sccm_elevate2",      "NTLM Relay → SCCM (ELEVATE-2)"),         # 12 sccm_elevate2
+    ("ntlm_relay_checker.checks.kerberos",           "Kerberos Relay → ADCS (krbrelayx + Forshaw DNS)"), # 6  kerberos
+    ("ntlm_relay_checker.checks.laps",               "NTLM Relay → LDAP (LAPS Password Dump)"),# 7  laps
+    ("ntlm_relay_checker.checks.ldaps_addcomputer",  "NTLM Relay → LDAPS (Add Computer Account)"), # 8  addcomputer
+    ("ntlm_relay_checker.checks.ldaps_aclabuse",     "NTLM Relay → LDAPS (ACL Abuse)"),        # 9  acl
+    ("ntlm_relay_checker.checks.sccm_takeover",      "NTLM Relay → SCCM (TAKEOVER-1/2)"),      # 10 sccm_takeover
+    ("ntlm_relay_checker.checks.sccm_elevate2",      "NTLM Relay → SCCM (ELEVATE-2)"),         # 11 sccm_elevate2
 ]
 
 

@@ -221,13 +221,12 @@ def main() -> int:
         "adcs":          3,
         "esc11":         4,
         "mssql":         5,
-        "webdav":        6,
-        "kerberos":      7,
-        "laps":          8,
-        "addcomputer":   9,
-        "acl":          10,
-        "sccm_takeover": 11,
-        "sccm_elevate2": 12,
+        "kerberos":      6,
+        "laps":          7,
+        "addcomputer":   8,
+        "acl":           9,
+        "sccm_takeover": 10,
+        "sccm_elevate2": 11,
     }
 
     # Group aliases: expand to multiple module names before MODULE_ALIASES lookup

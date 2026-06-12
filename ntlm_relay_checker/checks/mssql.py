@@ -480,6 +480,20 @@ class MssqlWebClientCheck(BaseCheck):
                     "running" in combined
                 ):
                     webclient_hosts.append(host)
+                else:
+                    # Fallback: check via --services if --module webdav was ambiguous
+                    r2 = subprocess.run(
+                        ["nxc", "smb", host,
+                         "-u", self.env.cred.username,
+                         *(([ "-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
+                         "-d", self.env.domain,
+                         "--services"],
+                        capture_output=True, text=True,
+                        timeout=self.env.timeout + 10,
+                    )
+                    combined2 = (r2.stdout + r2.stderr).lower()
+                    if "webclient" in combined2 and ("running" in combined2 or "started" in combined2):
+                        webclient_hosts.append(host)
             except Exception:
                 pass
 

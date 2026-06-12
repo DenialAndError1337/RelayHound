@@ -307,20 +307,7 @@ Relay NTLM to SQL Server. Allows `xp_cmdshell` execution depending on privileges
 
 ---
 
-### 7. NTLM Relay → HTTP/WebDAV
-
-Coerce a Windows machine to authenticate via WebDAV (HTTP + NTLM), bypassing SMB signing. The WebClient service must be running on the target.
-
-| Check                                  | Required    | Method                     |
-| -------------------------------------- | ----------- | -------------------------- |
-| WebClient service running on ≥1 target | ✅           | `nxc smb --module webdav`  |
-| HTTP relay listener port accessible    | ✅           | TCP port 80 on attacker    |
-| SMB signing enforced (bypass needed)   | ⚠️ Optional | `nxc smb` signing check    |
-| Coercion method available              | ⚠️ Optional | `nxc smb --module spooler` |
-
----
-
-### 8. Kerberos Relay → ADCS (krbrelayx + Forshaw DNS)
+### 7. Kerberos Relay → ADCS (krbrelayx + Forshaw DNS)
 
 Relay Kerberos authentication to ADCS using krbrelayx. Three coercion paths are supported. ADIDNS write access is only required for path 1.
 
@@ -349,7 +336,7 @@ Relay Kerberos authentication to ADCS using krbrelayx. Three coercion paths are 
 
 ---
 
-### 9. NTLM Relay → LDAP (LAPS Password Dump)
+### 8. NTLM Relay → LDAP (LAPS Password Dump)
 
 Relay NTLM to LDAP to read `ms-Mcs-AdmPwd` from computer objects where the relayed account has read access.
 
@@ -363,7 +350,7 @@ Relay NTLM to LDAP to read `ms-Mcs-AdmPwd` from computer objects where the relay
 
 ---
 
-### 10. NTLM Relay → LDAPS (Add Computer Account)
+### 9. NTLM Relay → LDAPS (Add Computer Account)
 
 Relay NTLM to LDAPS to add a new computer account to the domain (requires MachineAccountQuota > 0).
 
@@ -377,7 +364,7 @@ Relay NTLM to LDAPS to add a new computer account to the domain (requires Machin
 
 ---
 
-### 11. NTLM Relay → LDAPS (ACL Abuse)
+### 10. NTLM Relay → LDAPS (ACL Abuse)
 
 Relay NTLM to LDAPS to modify ACLs on AD objects — granting DCSync rights, adding group members, or writing to computer objects.
 
@@ -392,7 +379,7 @@ Relay NTLM to LDAPS to modify ACLs on AD objects — granting DCSync rights, add
 
 ---
 
-### 12. NTLM Relay → SCCM (TAKEOVER-1 / TAKEOVER-2)
+### 11. NTLM Relay → SCCM (TAKEOVER-1 / TAKEOVER-2)
 
 Coerce NTLM authentication from the SCCM site server machine account and relay it to the remote site database. The site server's machine account has `db_owner` on the site database by default, which allows granting any domain account the SCCM "Full Administrator" role — giving arbitrary code execution on all managed SCCM clients as SYSTEM.
 
@@ -421,7 +408,7 @@ Site database hostname is discovered automatically via MSSQLSvc SPN lookup in AD
 
 ---
 
-### 13. NTLM Relay → SCCM (ELEVATE-2)
+### 12. NTLM Relay → SCCM (ELEVATE-2)
 
 Trigger SCCM's automatic client push installation to coerce NTLM authentication from the site server's push installation accounts (or machine account as fallback), then relay to a target. Client push accounts typically have local admin across all managed clients. If the push account is a Domain Admin or falls back to the site server machine account, impact escalates to TAKEOVER-1/2 territory.
 
@@ -477,7 +464,6 @@ ntlm_relay_checker/
     ├── adcs.py                  NTLM Relay → ADCS (ESC8)
     ├── esc11.py                 NTLM Relay → ADCS (ESC11 / RPC)
     ├── mssql.py                 NTLM Relay → MSSQL
-    ├── webdav.py                NTLM Relay → HTTP/WebDAV
     ├── kerberos.py              Kerberos Relay → ADCS (krbrelayx)
     ├── laps.py                  NTLM Relay → LDAP (LAPS)
     ├── ldaps_addcomputer.py     NTLM Relay → LDAPS (Add Computer)

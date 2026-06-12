@@ -223,8 +223,9 @@ def _build_attack_chains(
 
     def _coerce_cmd(target: str) -> str:
         """Best available coercion command for a target."""
-        webdav_ar = _get_ar("WebDAV")
-        if _check_pass(webdav_ar, "WebClient service running"):
+        # Check WebClient status from any module that includes the optional WebClient check
+        _webclient_ar = _get_ar("RBCD") or _get_ar("Shadow Credentials") or _get_ar("LAPS")
+        if _check_pass(_webclient_ar, "WebClient"):
             # WebClient is running: coerce over HTTP (WebDAV/UNC) via PetitPotam HTTP mode.
             # The listener argument MUST be a hostname (not IP) — Windows will only follow
             # a WebDAV UNC path to a hostname; an IP triggers SMB, not WebDAV.
