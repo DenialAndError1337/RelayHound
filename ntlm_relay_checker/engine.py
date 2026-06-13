@@ -54,11 +54,24 @@ def run_all_checks(
         checks = mod.get_checks(env)
         ar = AttackResult(attack_name=attack_name)
 
+        blocked_by: str | None = None
         for check in checks:
+            if blocked_by is not None:
+                # A prior gatekeeper failed — skip remaining checks
+                ar.checks.append(CheckResult(
+                    name=check.name, status=Status.SKIP,
+                    detail=f"Skipped — {blocked_by} failed (prerequisite not met).",
+                    required=check.required,
+                ))
+                continue
             check_result = check.run()
             ar.checks.append(check_result)
             if progress_callback:
                 progress_callback(attack_name, check_result.name, check_result)
+            if (check_result.status == Status.FAIL
+                    and check.required
+                    and check.breaks_on_fail):
+                blocked_by = check.name
 
         results.append(ar)
 
@@ -94,12 +107,24 @@ def run_checks_parallel(
         checks = mod.get_checks(env)
         ar = AttackResult(attack_name=attack_name)
 
+        blocked_by: str | None = None
         for check in checks:
+            if blocked_by is not None:
+                ar.checks.append(CheckResult(
+                    name=check.name, status=Status.SKIP,
+                    detail=f"Skipped — {blocked_by} failed (prerequisite not met).",
+                    required=check.required,
+                ))
+                continue
             check_result = check.run()
             ar.checks.append(check_result)
             if progress_callback:
                 with lock:
                     progress_callback(attack_name, check_result.name, check_result)
+            if (check_result.status == Status.FAIL
+                    and check.required
+                    and check.breaks_on_fail):
+                blocked_by = check.name
 
         results[idx] = ar
 

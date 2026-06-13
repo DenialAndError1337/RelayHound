@@ -53,6 +53,14 @@ class TargetEnv:
     # IP → short hostname map built at startup (covers DCs + extra targets)
     hostname_map: dict[str, str]  = field(default_factory=dict)
 
+    # Shared cache for cross-module short-circuiting.
+    # Modules write sentinel values here after running their first gatekeeper
+    # check so subsequent modules can skip without repeating the same query.
+    # Keys defined so far:
+    #   "adcs_deployed"  : bool — False if AdcsDeployedCheck confirmed no ADCS
+    #   "sccm_present"   : bool — False if SCCMDetectedCheck confirmed no SCCM
+    shared_cache: dict = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         # Ensure dc_ips always contains at least the primary DC so modules
         # can rely on it being non-empty before startup discovery runs.

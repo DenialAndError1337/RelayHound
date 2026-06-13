@@ -48,7 +48,8 @@ class CoercePlusResult:
     dfscoerce:    bool = False
     shadowcoerce: bool = False
     mseven:       bool = False
-    tool_unavailable: bool = False
+    tool_unavailable: bool = False   # nxc binary not present at all
+    errored:      bool = False       # probe could not complete (timeout/other) — status unknown
     raw_output:   str  = ""
 
     @property
@@ -99,8 +100,15 @@ def _run_coerce_plus(host: str, env: TargetEnv) -> CoercePlusResult:
 
     rc, out, err = _run_nxc_smb(base_args, env, timeout=env.timeout + 20)
 
-    if rc == -1 and "nxc not found" in err:
-        result.tool_unavailable = True
+    if rc == -1:
+        # rc == -1 is the sentinel for "subprocess did not complete": either the
+        # nxc binary is missing, or it timed out / errored. Neither case means
+        # "no coercion methods" — empty output here must NOT be read as a clean
+        # host (that would understate attack viability). Flag and bail.
+        if "nxc not found" in err:
+            result.tool_unavailable = True
+        else:
+            result.errored = True
         return result
 
     result.raw_output = out + err
@@ -157,40 +165,192 @@ class CoercionAvailabilityCheck(BaseCheck):
         for host in self.env.all_targets:
             results.append(_run_coerce_plus(host, self.env))
 
-        if results and results[0].tool_unavailable:
+        if any(r.tool_unavailable for r in results):
             return CheckResult(
                 name=self.name, status=Status.SKIP,
                 detail="nxc not found — install NetExec to enable coerce_plus checks.",
             )
 
         vulnerable    = [r for r in results if r.any_method]
-        none_detected = [r for r in results if not r.any_method and not r.tool_unavailable]
+        errored       = [r for r in results if r.errored]
+        none_detected = [r for r in results
+                         if not r.any_method and not r.errored and not r.tool_unavailable]
+
+        def _hp(r):  # host (hostname) label
+            return f"{self.env.hostname_map.get(r.host, r.host)} ({r.host})"
 
         if not vulnerable:
-            return CheckResult(
-                name=self.name, status=Status.WARN,
-                detail=(
-                    "coerce_plus found no vulnerable SMB coercion methods on any target "
-                    f"({', '.join(r.host for r in results)}). "
-                    "Out-of-band coercion (LLMNR/NBT-NS poisoning, mitm6, social engineering) "
-                    "may still be possible. WebDAV/HTTP paths checked separately."
-                ),
+            # No methods found. If no host actually completed a probe, we can't
+            # conclude anything — SKIP. Otherwise WARN, but call out any hosts
+            # whose probe did not complete so they aren't read as "clean".
+            if not none_detected:
+                return CheckResult(
+                    name=self.name, status=Status.SKIP,
+                    detail=(
+                        "coerce_plus could not complete on any target "
+                        f"({', '.join(_hp(r) for r in errored) or 'none'}) — "
+                        "coercion availability undetermined (timeout or error)."
+                    ),
+                )
+            detail = (
+                "coerce_plus found no vulnerable SMB coercion methods on "
+                f"{', '.join(_hp(r) for r in none_detected)}. "
+                "Out-of-band coercion (LLMNR/NBT-NS poisoning, mitm6, social engineering) "
+                "may still be possible. WebDAV/HTTP paths checked separately."
             )
+            if errored:
+                detail += (f" NOTE: probe did not complete on {', '.join(_hp(r) for r in errored)} "
+                           "(timeout/error) — those hosts are undetermined, not confirmed clean.")
+            return CheckResult(name=self.name, status=Status.WARN, detail=detail)
 
         lines = []
         for r in vulnerable:
             hostname = self.env.hostname_map.get(r.host, r.host)
             lines.append(f"{hostname} ({r.host}): {r.method_summary()}")
 
-        no_methods = [
-            f"{self.env.hostname_map.get(r.host, r.host)} ({r.host})"
-            for r in none_detected
-        ]
         summary = "; ".join(lines)
-        if no_methods:
-            summary += f". No methods found on: {', '.join(no_methods)}"
+        if none_detected:
+            summary += f". No methods found on: {', '.join(_hp(r) for r in none_detected)}"
+        if errored:
+            summary += (f". Undetermined (timeout/error, not confirmed clean): "
+                        f"{', '.join(_hp(r) for r in errored)}")
 
         return CheckResult(
             name=self.name, status=Status.PASS,
             detail=summary,
         )
+
+
+# ── shared AD CS presence probe (authoritative) ─────────────────────────────
+
+@dataclass
+class AdcsVerdict:
+    """Result of the authoritative AD CS-presence probe.
+
+    status == PASS : >= 1 Enterprise CA registered in AD
+    status == FAIL : no CA registered (container absent or empty)
+    status == SKIP : LDAP bind/query inconclusive — caller should fall back to
+                     tool-based detection. The shared cache is NOT written.
+    """
+    status: Status
+    detail: str
+    ca_names: list
+    ca_hosts: list
+
+
+def adcs_enrollment_verdict(env: TargetEnv) -> "AdcsVerdict":
+    """
+    Authoritative AD CS-presence probe shared by the adcs, esc11 and kerberos
+    modules. Determines whether an Enterprise CA is registered in AD by
+    searching for pKIEnrollmentService objects under the *forest-root*
+    Configuration partition — the canonical CA registration object, and the
+    same signal certipy/Certify key on.
+
+    Why LDAP rather than tool-output parsing:
+      - An empty result is a *definitive* "no CA" answer (gives a real FAIL,
+        not a fragile SKIP), while a CA whose host VM is offline still has its
+        object in AD, so it correctly stays PASS.
+      - The Configuration NC is read from RootDSE rather than constructed from
+        the domain name; in a child domain the Configuration partition lives at
+        the forest root, so a constructed NC would false-FAIL.
+
+    Caching: reads and writes env.shared_cache["adcs_deployed"] so the answer
+    is computed once per run regardless of which module runs first. This is the
+    ONLY place that key should be written — facts like "certsrv HTTP reachable"
+    are separate and must not poison it.
+    """
+    cached = env.shared_cache.get("adcs_deployed")
+    if cached is True:
+        return AdcsVerdict(Status.PASS,
+                           "AD CS deployed (confirmed earlier this run).", [], [])
+    if cached is False:
+        return AdcsVerdict(Status.FAIL,
+                           "AD CS not deployed (confirmed earlier this run).", [], [])
+
+    try:
+        from ldap3 import Server, Connection, NTLM, SUBTREE, ALL
+    except ImportError:
+        return AdcsVerdict(Status.SKIP, "ldap3 not installed.", [], [])
+
+    try:
+        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
+        # ldap3 NTLM accepts the NT hash as "LMHASH:NTHASH"; use the empty-LM
+        # prefix when only the NT hash is supplied.
+        if env.cred.nt_hash:
+            nh = env.cred.nt_hash.split(":")[-1]
+            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
+        else:
+            auth_password = env.cred.password
+        conn = Connection(server, user=env.cred.upn, password=auth_password,
+                          authentication=NTLM, auto_bind=True)
+    except Exception:
+        return AdcsVerdict(Status.SKIP,
+                           "LDAP bind refused/failed — inconclusive.", [], [])
+
+    config_nc = None
+    try:
+        other = getattr(server.info, "other", {}) or {}
+        vals = other.get("configurationNamingContext")
+        if vals:
+            config_nc = str(vals[0])
+    except Exception:
+        config_nc = None
+    if not config_nc:
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+        return AdcsVerdict(Status.SKIP,
+                           "Could not read RootDSE configurationNamingContext.", [], [])
+
+    base = (f"CN=Enrollment Services,CN=Public Key Services,"
+            f"CN=Services,{config_nc}")
+    try:
+        conn.search(search_base=base,
+                    search_filter="(objectClass=pKIEnrollmentService)",
+                    search_scope=SUBTREE, attributes=["cn", "dNSHostName"])
+    except Exception:
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+        return AdcsVerdict(Status.SKIP, "LDAP search error — inconclusive.", [], [])
+
+    result_code = (conn.result or {}).get("result")
+    entries = list(conn.entries)
+
+    if entries:
+        ca_names, hosts = [], []
+        for e in entries:
+            ca_names.append(str(e["cn"]) if "cn" in e else "?")
+            if "dNSHostName" in e and e["dNSHostName"]:
+                hosts.append(str(e["dNSHostName"]))
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+        env.shared_cache["adcs_deployed"] = True
+        detail = f"CA(s) registered in AD: {', '.join(ca_names)}"
+        if hosts:
+            detail += f" on {', '.join(hosts)}"
+        detail += " (LDAP pKIEnrollmentService — authoritative)."
+        return AdcsVerdict(Status.PASS, detail, ca_names, hosts)
+
+    try:
+        conn.unbind()
+    except Exception:
+        pass
+
+    if result_code == 32:  # noSuchObject
+        env.shared_cache["adcs_deployed"] = False
+        return AdcsVerdict(Status.FAIL,
+            "No Enrollment Services container in the Configuration partition — "
+            "AD CS has never been deployed in this forest.", [], [])
+    if result_code == 0:
+        env.shared_cache["adcs_deployed"] = False
+        return AdcsVerdict(Status.FAIL,
+            "Enrollment Services container present but holds no "
+            "pKIEnrollmentService objects — no Enterprise CA registered.", [], [])
+
+    return AdcsVerdict(Status.SKIP,
+                       f"Unexpected LDAP result code {result_code}.", [], [])

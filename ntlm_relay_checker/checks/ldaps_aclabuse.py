@@ -160,6 +160,11 @@ class WeakAclObjectsCheck(BaseCheck):
     """
 
     name = "Writable high-value AD objects exist"
+    # Optional/informational: probes the OPERATOR's current write rights. ACL abuse
+    # is carried out via the relayed victim's rights, so "nothing writable by me"
+    # must NOT make the attack NOT VIABLE — viability is driven by the protocol
+    # prerequisites (LDAPS reachable / channel binding) checked above.
+    required = False
 
     def _run(self) -> CheckResult:
         # Try bloodyAD writable check
@@ -182,11 +187,16 @@ class WeakAclObjectsCheck(BaseCheck):
             }
 
             # Build clean object list: "CN (permission)", skipping noise containers
+            # and the operator's own account (users always have self-write on their
+            # own object; it's not an ACL-abuse target).
+            own_cn = self.env.cred.username.lower()
             objects = []
             for i, cn in enumerate(dn_matches[:12]):
                 cn_clean = cn.strip()
                 if cn_clean.lower() in ad_containers:
                     continue
+                if cn_clean.lower() == own_cn:
+                    continue  # self-write, not a relay target
                 perm = perm_matches[i].strip() if i < len(perm_matches) else "WRITE"
                 objects.append(f"{cn_clean} ({perm.strip()})")
                 if len(objects) >= 8:
@@ -236,11 +246,13 @@ class WeakAclObjectsCheck(BaseCheck):
             # bloodyAD returned output but all entries were noise containers
             if out.strip():
                 return CheckResult(
-                    name=self.name, status=Status.FAIL,
+                    name=self.name, status=Status.WARN,
                     detail=(
                         "bloodyAD found only default system containers — "
-                        "no meaningful writable objects for ACL abuse. "
-                        "Verify with BloodHound for inherited or delegated rights."
+                        "no meaningful writable objects for ACL abuse with this account. "
+                        "Does not block the attack — a higher-privileged relayed account "
+                        "may have write access. Verify with BloodHound for inherited or "
+                        "delegated rights."
                     ),
                 )
 

@@ -365,6 +365,10 @@ def main() -> int:
         "attacker_hostname": env.attacker_hostname,
         "hostname_map":      env.hostname_map,
         "extra_targets": extra,
+        # NOTE: password/nt_hash included for terminal attack-chain display ONLY.
+        # Report writers (MD/HTML/JSON) must never read or emit these fields.
+        "password": cred.password,
+        "nt_hash":  cred.nt_hash,
     }
 
     # ── Print terminal summary ─────────────────────────────────────

@@ -60,7 +60,7 @@ import urllib.error
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
-from ..utils import CoercionAvailabilityCheck
+from ..utils import CoercionAvailabilityCheck, adcs_enrollment_verdict
 
 try:
     import ldap3
@@ -147,92 +147,62 @@ class AdcsHttpEnrollmentCheck(BaseCheck):
     """
 
     name = "ADCS HTTP enrollment (certsrv) reachable"
+    breaks_on_fail = True  # no certsrv = nowhere to relay; skip all downstream checks
 
     def _run(self) -> CheckResult:
-        # Check for CA via nxc adcs module
-        rc, out, err = _run_nxc(
-            ["ldap", self.env.dc_ip,
-             "-u", self.env.cred.username,
-             *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
-             "-d", self.env.domain,
-             "--module", "adcs"],
-            self.env,
-        )
-        combined = out + err
-        lower = combined.lower()
-
-        # nxc adcs failure: noSuchObject = no CA in this domain
-        if "nosuchobject" in lower or ("unexpected exception" in lower and "enrollment" in lower):
+        # Authoritative shared probe for CA existence (reads/writes the cache).
+        # This module does NOT write the cache itself: "certsrv HTTP reachable"
+        # is a separate fact and must not poison shared_cache["adcs_deployed"].
+        v = adcs_enrollment_verdict(self.env)
+        if v.status == Status.FAIL:
             return CheckResult(
                 name=self.name, status=Status.FAIL,
-                detail=(
-                    "No AD CS enrollment services found in this domain. "
-                    "Kerberos relay via krbrelayx requires a certsrv HTTP endpoint. "
-                    "Check if CA exists in a parent/sibling domain."
-                ),
-                raw=combined[:400],
+                detail=(f"{v.detail} Kerberos relay via krbrelayx needs a "
+                        "certsrv HTTP endpoint, which cannot exist without a CA."),
             )
 
-        # Parse CA name and host from nxc output
-        ca_names = re.findall(r"Found CN:[\s]*([^\s\n\r]+)", combined, re.IGNORECASE)
-        ca_hosts = re.findall(r"Found PKI Enrollment Server:[\s]*([^\s\n\r]+)",
-                              combined, re.IGNORECASE)
-
-        # Now check if certsrv HTTP is actually reachable
+        # CA exists (PASS) or LDAP inconclusive (SKIP): probe certsrv HTTP.
+        ca_names, ca_hosts = v.ca_names, v.ca_hosts
         http_endpoints = []
         for host in self.env.all_targets:
             if not _port_open(host, 80, timeout=self.env.timeout):
                 continue
             code, headers = _http_get_headers(
-                f"http://{host}/certsrv/", timeout=self.env.timeout
-            )
+                f"http://{host}/certsrv/", timeout=self.env.timeout)
             if code in (200, 401, 403):
                 http_endpoints.append(host)
 
-        if ca_names or ca_hosts:
+        if v.status == Status.PASS:
             ca_summary = ""
             if ca_names:
                 ca_summary += f"CA: {', '.join(ca_names[:2])}"
             if ca_hosts:
                 ca_summary += f"{'; ' if ca_summary else ''}Host: {', '.join(ca_hosts[:2])}"
-
+            ca_summary = ca_summary or "CA registered in AD"
             if http_endpoints:
                 return CheckResult(
                     name=self.name, status=Status.PASS,
-                    detail=(
-                        f"AD CS deployed ({ca_summary}) and certsrv HTTP reachable "
-                        f"on: {', '.join(http_endpoints)}. Valid krbrelayx relay target."
-                    ),
+                    detail=(f"AD CS deployed ({ca_summary}) and certsrv HTTP reachable "
+                            f"on: {', '.join(http_endpoints)}. Valid krbrelayx relay target."),
                 )
             return CheckResult(
                 name=self.name, status=Status.WARN,
-                detail=(
-                    f"AD CS deployed ({ca_summary}) but certsrv HTTP not found "
-                    f"on port 80 of any target. "
-                    "Verify CA hostname and ensure port 80 is reachable."
-                ),
+                detail=(f"AD CS deployed ({ca_summary}) but certsrv HTTP not found on "
+                        "port 80 of any target. Verify CA hostname and port 80 reachability."),
             )
 
-        # Fallback: direct certsrv check even without nxc CA detection
+        # v.status == SKIP — LDAP inconclusive; report on HTTP evidence alone.
         if http_endpoints:
             return CheckResult(
                 name=self.name, status=Status.WARN,
-                detail=(
-                    f"certsrv HTTP reachable on {', '.join(http_endpoints)} "
-                    "but could not confirm CA name via nxc. "
-                    "Run: `nxc ldap <dc> -u <user> -p <pass> --module adcs`"
-                ),
+                detail=(f"certsrv HTTP reachable on {', '.join(http_endpoints)} but CA "
+                        "presence could not be confirmed via LDAP. "
+                        "Run: nxc ldap <dc> --module adcs"),
             )
-
-        if rc == -1:
-            return CheckResult(
-                name=self.name, status=Status.SKIP,
-                detail="nxc not available. Try: `certipy-ad find -vulnerable -stdout`",
-            )
-
         return CheckResult(
-            name=self.name, status=Status.FAIL,
-            detail="No ADCS enrollment services or certsrv HTTP endpoint found.",
+            name=self.name, status=Status.SKIP,
+            detail=("Could not confirm AD CS via LDAP and no certsrv HTTP endpoint "
+                    "found. Try: certipy-ad find -vulnerable -stdout"),
         )
 
 
@@ -685,20 +655,6 @@ class WebClientCoercionCheck(BaseCheck):
                     "running" in combined
                 ):
                     webclient_hosts.append(host)
-                else:
-                    # Fallback: check via --services if --module webdav was ambiguous
-                    r2 = subprocess.run(
-                        ["nxc", "smb", host,
-                         "-u", self.env.cred.username,
-                         *(([ "-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
-                         "-d", self.env.domain,
-                         "--services"],
-                        capture_output=True, text=True,
-                        timeout=self.env.timeout + 10,
-                    )
-                    combined2 = (r2.stdout + r2.stderr).lower()
-                    if "webclient" in combined2 and ("running" in combined2 or "started" in combined2):
-                        webclient_hosts.append(host)
             except Exception:
                 pass
 

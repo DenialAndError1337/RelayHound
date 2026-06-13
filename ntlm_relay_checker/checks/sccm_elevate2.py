@@ -82,8 +82,16 @@ class ManagementPointReachableCheck(BaseCheck):
     """Check that the SCCM management point is reachable on HTTP or HTTPS."""
 
     name = "Management point reachable (HTTP/HTTPS)"
+    breaks_on_fail = True  # no MP reachable = client push coercion impossible
 
     def _run(self) -> CheckResult:
+        # Cross-module short-circuit: sccm_takeover.py may have confirmed no SCCM
+        if self.env.shared_cache.get("sccm_present") is False:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail="SCCM not deployed in this domain (confirmed by TAKEOVER module).",
+            )
+
         disc = _get_discovery(self.env)
         candidates = disc.management_points or disc.site_servers
         if not candidates:
@@ -205,7 +213,7 @@ class UnsignedSMBRelayTargetsCheck(BaseCheck):
                 self.env,
             )
             combined = (out + err).lower()
-            if rc != -1 and "signing:false" in combined or "signing not required" in combined:
+            if rc != -1 and ("signing:false" in combined or "signing not required" in combined):
                 unsigned.append(host)
 
         if unsigned:

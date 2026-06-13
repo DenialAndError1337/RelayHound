@@ -24,7 +24,7 @@ import urllib.error
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 from .esc11 import RequestDispositionCheck
-from ..utils import CoercionAvailabilityCheck
+from ..utils import CoercionAvailabilityCheck, adcs_enrollment_verdict
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -110,44 +110,65 @@ def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[i
 
 class AdcsDeployedCheck(BaseCheck):
     """
-    AD CS must be deployed. Check via LDAP for PKI containers and
-    optionally nxc --module adcs.
+    AD CS must be deployed in the *target* domain for ESC8 relay to have a
+    certsrv endpoint to relay to.
 
-    Method: nxc ldap <dc> --module adcs
-            OR ldap query CN=Enrollment Services,CN=Public Key Services,...
+    Detection strategy — authoritative signal first:
+
+      1. LDAP (primary): search for pKIEnrollmentService objects under
+         CN=Enrollment Services,CN=Public Key Services,CN=Services,<configNC>.
+         That object is the canonical Enterprise-CA registration — the same
+         signal certipy/Certify key on. The Configuration NC is read from
+         RootDSE (configurationNamingContext), NOT built from the domain name:
+         in a child domain the Configuration partition lives at the forest
+         root, so constructing it from the local domain yields a spurious
+         noSuchObject and a false "no ADCS" verdict.
+           >= 1 entry              -> PASS  (CA registered; still true when the
+                                     CA host VM is offline — the object persists)
+           0 entries / noSuchObject -> FAIL  (no Enterprise CA in this domain)
+           bind/query inconclusive  -> fall through to (2)
+
+      2. nxc / certipy (fallback enrichment): consulted only when the LDAP
+         probe could not give a definitive answer (e.g. NTLM-over-LDAP refused).
+         Trusted for a best-effort PASS only — their output strings are
+         version-dependent, so a non-match yields SKIP, never a fragile FAIL.
     """
 
     name = "AD CS deployed in domain"
+    breaks_on_fail = True  # all downstream checks are pointless without ADCS
+
+    _LDAP_NO_SUCH_OBJECT = 32  # RFC 4511 resultCode for noSuchObject
+
+    def _ldap_verdict(self) -> "CheckResult | None":
+        """
+        Authoritative pKIEnrollmentService probe. Delegates to the shared
+        utils.adcs_enrollment_verdict() (which also reads/writes the
+        cross-module cache), and adapts its tri-state result:
+          PASS/FAIL -> definitive CheckResult
+          SKIP      -> None, so _run() falls back to nxc/certipy enrichment
+        """
+        v = adcs_enrollment_verdict(self.env)
+        if v.status in (Status.PASS, Status.FAIL):
+            return CheckResult(name=self.name, status=v.status, detail=v.detail)
+        return None
 
     def _run(self) -> CheckResult:
-        # Try nxc adcs module
+        # 1. Authoritative LDAP probe.
+        verdict = self._ldap_verdict()
+        if verdict is not None:
+            return verdict
+
+        # 2. Fallback enrichment — only reached when LDAP was inconclusive.
+        #    Trusted for PASS, never for FAIL.
+        import re
         rc, out, err = _run_nxc_ldap(["--module", "adcs"], self.env)
         combined = out + err
         if rc != -1 and combined.strip():
-            lower = combined.lower()
-            import re
-
-            # nxc adcs failure: "noSuchObject" or "[-] Obtained unexpected exception"
-            # means the PKI container doesn't exist in this domain — no CA here
-            if "nosuchobject" in lower or ("unexpected exception" in lower and "enrollment" in lower):
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail=(
-                        "No AD CS enrollment services found in this domain "
-                        "(nxc adcs: noSuchObject). The CA likely lives in a parent/sibling domain. "
-                        "ESC8 relay requires a certsrv endpoint in the target domain."
-                    ),
-                    raw=combined[:400],
-                )
-
-            # nxc adcs success lines:
-            #   "Found PKI Enrollment Server: kingslanding.sevenkingdoms.local"
-            #   "Found CN: SEVENKINGDOMS-CA"
-            ca_hosts = re.findall(r"Found PKI Enrollment Server:[\s]*([^\s\n\r]+)", combined, re.IGNORECASE)
-
-            ca_names = re.findall(r"Found CN:[\s]*([^\s\n\r]+)", combined, re.IGNORECASE)
-
-
+            ca_hosts = re.findall(
+                r"Found PKI Enrollment Server:[\s]*([^\s\n\r]+)",
+                combined, re.IGNORECASE)
+            ca_names = re.findall(
+                r"Found CN:[\s]*([^\s\n\r]+)", combined, re.IGNORECASE)
             if ca_names or ca_hosts:
                 parts = []
                 if ca_names:
@@ -156,133 +177,125 @@ class AdcsDeployedCheck(BaseCheck):
                     parts.append(f"Host: {', '.join(ca_hosts[:2])}")
                 return CheckResult(
                     name=self.name, status=Status.PASS,
-                    detail=f"AD CS deployed — {'; '.join(parts)}",
+                    detail=f"AD CS deployed — {'; '.join(parts)} (nxc adcs).",
                     raw=combined[:400],
                 )
 
-            if "no" in lower and "ca" in lower:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="nxc adcs module found no Certificate Authority.",
-                    raw=combined[:400],
-                )
-
-        # Fallback: certipy find
         rc2, out2, err2 = _run_certipy([
             "find",
             "-u", f"{self.env.cred.username}@{self.env.domain}",
-            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
+            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash
+               else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
         ], timeout=30)
         combined2 = (out2 + err2).lower()
-        if rc2 != -1:
-            if "certificate authorit" in combined2 or "ca name" in combined2:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="AD CS CA found via certipy.",
-                    raw=(out2 + err2)[:400],
-                )
-            if "no certificate" in combined2 or "no ca" in combined2:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="certipy found no CA in the domain.",
-                )
-
-        # Fallback: try ldap3
-        try:
-            import ldap3
-            from ldap3 import Server, Connection, NTLM, SUBTREE
-            server = ldap3.Server(self.env.dc_ip, connect_timeout=self.env.timeout)
-            conn = Connection(
-                server, user=self.env.cred.upn, password=self.env.cred.password,
-                authentication=NTLM, auto_bind=True,
+        if rc2 != -1 and ("certificate authorit" in combined2 or "ca name" in combined2):
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail="AD CS CA found via certipy.",
+                raw=(out2 + err2)[:400],
             )
-            config_dn = "CN=Configuration," + ",".join(
-                f"DC={p}" for p in self.env.domain.split(".")
-            )
-            conn.search(
-                search_base=f"CN=Enrollment Services,CN=Public Key Services,"
-                            f"CN=Services,{config_dn}",
-                search_filter="(objectClass=pKIEnrollmentService)",
-                search_scope=SUBTREE,
-                attributes=["cn", "dNSHostName"],
-            )
-            if conn.entries:
-                ca_names = [str(e["cn"]) for e in conn.entries]
-                hosts = [str(e["dNSHostName"]) for e in conn.entries]
-                conn.unbind()
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=f"CA(s) found: {', '.join(ca_names)} on {', '.join(hosts)}",
-                )
-            conn.unbind()
-        except Exception:
-            pass
 
         return CheckResult(
             name=self.name, status=Status.SKIP,
-            detail="Could not query for AD CS. Try: certipy-ad find or nxc ldap --module adcs",
+            detail=("Could not determine AD CS presence. The LDAP bind to the "
+                    "DC may have been refused (NTLM-over-LDAP disabled?), and "
+                    "no tool confirmed a CA. Try: nxc ldap <dc> --module adcs "
+                    "or certipy-ad find -stdout."),
         )
+
+    def run(self) -> CheckResult:
+        result = super().run()
+        # Write to shared cache so esc11 and kerberos modules can skip the
+        # repeat query if ADCS is confirmed absent (or present).
+        if result.status == Status.FAIL:
+            self.env.shared_cache["adcs_deployed"] = False
+        elif result.status == Status.PASS:
+            self.env.shared_cache["adcs_deployed"] = True
+        return result
 
 
 class CertsrvHttpCheck(BaseCheck):
     """
-    The /certsrv endpoint must be reachable over HTTP (port 80) on the CA server.
-    NTLM relay requires HTTP (not HTTPS without EPA bypass).
+    The /certsrv endpoint must be reachable for ESC8. NTLM relay over plain HTTP
+    (port 80) is the cleanest path; relay over HTTPS (443) is also viable when
+    EPA is not enforced on the binding (see HttpsEpaCheck). So HTTPS-only is NOT
+    a hard failure — it's a WARN deferring to the EPA check. We FAIL only when no
+    certsrv endpoint is reachable on either port.
 
-    Method: curl/requests GET http://<ca>/certsrv/  → 401 with WWW-Authenticate: NTLM
+    Method: GET http(s)://<ca>/certsrv/ → 401 with WWW-Authenticate: NTLM
     """
 
-    name = "Web enrollment HTTP endpoint reachable (port 80)"
+    name = "Web enrollment endpoint reachable (HTTP or HTTPS)"
 
     def _run(self) -> CheckResult:
-        http_targets = []
-        # Check DC + extra targets
-        for host in self.env.all_targets:
-            if _port_open(host, 80, timeout=self.env.timeout):
-                http_targets.append(host)
+        http_targets  = [h for h in self.env.all_targets
+                         if _port_open(h, 80, timeout=self.env.timeout)]
+        https_targets = [h for h in self.env.all_targets
+                         if _port_open(h, 443, timeout=self.env.timeout)]
 
-        if not http_targets:
+        if not http_targets and not https_targets:
             return CheckResult(
                 name=self.name, status=Status.FAIL,
                 detail=(
-                    "Port 80 not reachable on any target. "
-                    "ESC8 requires the certsrv web enrollment to be HTTP-accessible."
+                    "Neither port 80 nor 443 reachable on any target. "
+                    "ESC8 requires a reachable certsrv web-enrollment endpoint."
                 ),
             )
 
-        ntlm_endpoints = []
-        other_endpoints = []
+        # HTTP path: look for 401 + NTLM challenge (ideal relay target).
+        ntlm_endpoints  = []
+        other_http      = []
         for host in http_targets:
-            url = f"http://{host}/certsrv/"
-            code, headers, body = _http_get(url, timeout=self.env.timeout)
+            code, headers, body = _http_get(f"http://{host}/certsrv/", timeout=self.env.timeout)
             auth = headers.get("WWW-Authenticate", "").upper()
             if code == 401 and "NTLM" in auth:
                 ntlm_endpoints.append(host)
             elif code in (200, 401, 403):
-                other_endpoints.append(f"{host}({code})")
+                other_http.append(f"{host}({code})")
 
         if ntlm_endpoints:
             return CheckResult(
                 name=self.name, status=Status.PASS,
                 detail=(
-                    f"/certsrv/ returns 401+NTLM on: {', '.join(ntlm_endpoints)}. "
-                    "Perfect relay target for ESC8."
+                    f"/certsrv/ returns 401+NTLM over HTTP on: {', '.join(ntlm_endpoints)}. "
+                    "Ideal relay target for ESC8."
                 ),
             )
-        if other_endpoints:
+
+        # HTTPS path: confirm certsrv answers over TLS. Relay viability then
+        # depends on EPA (HttpsEpaCheck), so this is a WARN, not a hard pass/fail.
+        https_certsrv = []
+        for host in https_targets:
+            code, headers, body = _http_get(f"https://{host}/certsrv/", timeout=self.env.timeout)
+            if code in (200, 401, 403):
+                https_certsrv.append(f"{host}({code})")
+
+        if https_certsrv:
             return CheckResult(
                 name=self.name, status=Status.WARN,
                 detail=(
-                    f"/certsrv/ found but without NTLM challenge: {', '.join(other_endpoints)}. "
-                    "May use Kerberos-only auth or redirects to HTTPS."
+                    f"/certsrv/ reachable over HTTPS on: {', '.join(https_certsrv)} "
+                    "(no plain-HTTP NTLM endpoint found). ESC8 over HTTPS is viable only "
+                    "if EPA is not enforced — see the HTTPS EPA check."
                 ),
             )
+
+        if other_http:
+            return CheckResult(
+                name=self.name, status=Status.WARN,
+                detail=(
+                    f"/certsrv/ found over HTTP without an NTLM challenge: {', '.join(other_http)}. "
+                    "May use Kerberos-only auth or redirect to HTTPS."
+                ),
+            )
+
+        reached = http_targets + https_targets
         return CheckResult(
             name=self.name, status=Status.FAIL,
             detail=(
-                f"Port 80 open on {', '.join(http_targets)} but /certsrv/ not found. "
+                f"Port 80/443 open on {', '.join(reached)} but /certsrv/ not found. "
                 "Web enrollment may not be installed."
             ),
         )

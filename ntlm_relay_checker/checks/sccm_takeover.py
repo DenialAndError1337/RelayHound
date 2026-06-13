@@ -164,19 +164,34 @@ class SCCMDiscovery:
             disc.present = False
 
         if not disc.present:
-            # Try a broader search in case the container path differs
+            # Authoritative fallback: search from CN=System (which always exists
+            # in a domain) for the container. This distinguishes a clean
+            # "not found" (-> FAIL: SCCM not deployed) from a search that did
+            # not complete (-> SKIP via disc.error), so a transient LDAP error
+            # can't masquerade as "SCCM not deployed". ldap3 here runs with
+            # raise_exceptions=False, so a failed op returns False with the
+            # code in conn.result rather than raising.
             try:
-                conn.search(
+                ok = conn.search(
                     search_base=f"CN=System,{domain_dn}",
                     search_filter="(cn=System Management)",
                     search_scope=SUBTREE,
                     attributes=["distinguishedName"],
                 )
+                result_code = (conn.result or {}).get("result")
                 disc.present = len(conn.entries) > 0
                 if disc.present:
                     sys_mgmt_dn = str(conn.entries[0]["distinguishedName"])
-            except Exception:
-                pass
+                elif not ok and result_code not in (0, 32):
+                    # 0 = success (genuinely 0 entries), 32 = noSuchObject (base
+                    # absent — still a definitive negative). Anything else means
+                    # the lookup did not complete; don't call that "no SCCM".
+                    disc.error = (
+                        f"System Management lookup did not complete "
+                        f"(LDAP result {result_code}); cannot confirm SCCM presence."
+                    )
+            except Exception as exc:
+                disc.error = f"System Management container lookup failed: {exc}"
 
         if not disc.present:
             conn.unbind()
@@ -297,6 +312,7 @@ class SCCMDetectedCheck(BaseCheck):
     """Detect SCCM in the domain via the System Management container in AD."""
 
     name = "SCCM detected in AD (System Management container)"
+    breaks_on_fail = True  # no SCCM = skip all downstream checks
 
     def _run(self) -> CheckResult:
         if not LDAP3_AVAILABLE:
@@ -340,6 +356,14 @@ class SCCMDetectedCheck(BaseCheck):
             name=self.name, status=Status.PASS,
             detail=" ".join(detail_parts),
         )
+
+    def run(self) -> CheckResult:
+        result = super().run()
+        if result.status == Status.FAIL:
+            self.env.shared_cache["sccm_present"] = False
+        elif result.status == Status.PASS:
+            self.env.shared_cache["sccm_present"] = True
+        return result
 
 
 class SiteServerReachableCheck(BaseCheck):
@@ -506,9 +530,10 @@ class SiteDBMSSQLCheck(BaseCheck):
 
         if rc == -1:
             return CheckResult(
-                name=self.name, status=Status.WARN,
+                name=self.name, status=Status.SKIP,
                 detail=f"MSSQL port 1433 open on {db_host} ({db_ip}) but nxc not available "
-                       "to confirm NTLM auth. TAKEOVER-1 relay path may be viable.",
+                       "to confirm NTLM auth — could not test. TAKEOVER-1 relay path may "
+                       "still be viable; install nxc (netexec) to confirm.",
                 raw=combined[:300],
             )
 

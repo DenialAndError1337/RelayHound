@@ -82,6 +82,17 @@ class BaseCheck(ABC):
         """Whether failure of this check makes the attack not viable."""
         return True
 
+    @property
+    def breaks_on_fail(self) -> bool:
+        """
+        If True and this check FAILs, the engine stops running remaining
+        checks in this module. Subsequent checks are recorded as SKIP with
+        a note explaining why. Only meaningful when required=True.
+        Use for hard gatekeepers where all downstream checks are pointless
+        if this one fails (e.g. ADCS not deployed, SCCM not present).
+        """
+        return False
+
     @abstractmethod
     def _run(self) -> CheckResult:
         """Implement the actual check logic here."""

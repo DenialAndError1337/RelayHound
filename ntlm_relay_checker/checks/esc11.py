@@ -30,7 +30,7 @@ import subprocess
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
-from ..utils import CoercionAvailabilityCheck
+from ..utils import CoercionAvailabilityCheck, adcs_enrollment_verdict
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -102,22 +102,24 @@ class AdcsDeployedCheck(BaseCheck):
     """
     AD CS must be deployed. Same check as ESC8 module.
     Method: nxc ldap --module adcs
+
+    Reads shared_cache["adcs_deployed"] if already set by adcs.py to avoid
+    repeating the same nxc query. Writes the result back for kerberos.py.
     """
 
     name = "AD CS deployed in domain"
+    breaks_on_fail = True  # all downstream ESC11 checks are pointless without ADCS
 
     def _run(self) -> CheckResult:
+        # Authoritative shared probe (reads/writes the cross-module cache).
+        v = adcs_enrollment_verdict(self.env)
+        if v.status in (Status.PASS, Status.FAIL):
+            return CheckResult(name=self.name, status=v.status, detail=v.detail)
+
+        # SKIP (LDAP inconclusive) -> fall back to nxc/certipy enrichment for PASS.
         rc, out, err = _run_nxc_ldap(["--module", "adcs"], self.env)
         combined = out + err
-        lower = combined.lower()
-
         if rc != -1 and combined.strip():
-            if "nosuchobject" in lower or ("unexpected exception" in lower and "enrollment" in lower):
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="No AD CS enrollment services found in this domain.",
-                    raw=combined[:400],
-                )
             ca_names = re.findall(r"Found CN:[\s]*([^\s\n\r]+)", combined, re.IGNORECASE)
             ca_hosts = re.findall(r"Found PKI Enrollment Server:[\s]*([^\s\n\r]+)",
                                   combined, re.IGNORECASE)
@@ -129,35 +131,38 @@ class AdcsDeployedCheck(BaseCheck):
                     parts.append(f"Host: {', '.join(ca_hosts[:2])}")
                 return CheckResult(
                     name=self.name, status=Status.PASS,
-                    detail=f"AD CS deployed — {'; '.join(parts)}",
+                    detail=f"AD CS deployed -- {'; '.join(parts)} (nxc adcs).",
                     raw=combined[:400],
                 )
 
-        # Fallback: certipy
         rc2, out2, err2 = _run_certipy([
             "find",
             "-u", f"{self.env.cred.username}@{self.env.domain}",
-            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
+            *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash
+               else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
         ])
         combined2 = (out2 + err2).lower()
-        if rc2 != -1:
-            if "certificate authorit" in combined2 or "ca name" in combined2:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="AD CS CA found via certipy.",
-                )
-            if "no certificate" in combined2:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="certipy found no CA in the domain.",
-                )
+        if rc2 != -1 and ("certificate authorit" in combined2 or "ca name" in combined2):
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail="AD CS CA found via certipy.",
+            )
 
         return CheckResult(
             name=self.name, status=Status.SKIP,
-            detail="Could not query for AD CS. Try: nxc ldap <dc> --module adcs",
+            detail=("Could not determine AD CS presence (LDAP inconclusive, "
+                    "no tool confirmed a CA). Try: nxc ldap <dc> --module adcs"),
         )
+
+    def run(self) -> CheckResult:
+        result = super().run()
+        if result.status == Status.FAIL:
+            self.env.shared_cache["adcs_deployed"] = False
+        elif result.status == Status.PASS:
+            self.env.shared_cache["adcs_deployed"] = True
+        return result
 
 
 class CaRpcReachableCheck(BaseCheck):

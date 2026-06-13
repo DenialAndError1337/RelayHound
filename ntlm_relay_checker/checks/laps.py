@@ -167,7 +167,7 @@ class LapsDeployedCheck(BaseCheck):
             if "computer:" in lower and "password:" in lower:
                 return CheckResult(
                     name=self.name, status=Status.PASS,
-                    detail="LAPS deployed and passwords readable with this account.",
+                    detail="LAPS deployed — ms-Mcs-AdmPwd attribute present and populated.",
                     raw=out[:300],
                 )
             # Not readable but schema present:
@@ -266,6 +266,11 @@ class LapsReadableCheck(BaseCheck):
     """
 
     name = "ms-Mcs-AdmPwd readable by current account"
+    # Optional/informational: this probes the OPERATOR's current rights. The
+    # relay uses the (privileged) relayed victim's read rights, so "not readable
+    # by me" must NOT make the attack NOT VIABLE — viability is driven by the
+    # protocol prerequisites (LDAP signing / channel binding) checked above.
+    required = False
 
     def _run(self) -> CheckResult:
         import re
@@ -294,11 +299,11 @@ class LapsReadableCheck(BaseCheck):
             # Not readable
             if "no result found with attribute" in lower:
                 return CheckResult(
-                    name=self.name, status=Status.FAIL,
+                    name=self.name, status=Status.WARN,
                     detail=(
                         "LAPS deployed but ms-Mcs-AdmPwd not readable with this account. "
-                        "Relay a higher-privileged account (delegated LAPS reader, "
-                        "Domain Admin, or local admin of target)."
+                        "Does not block the attack — relay a higher-privileged account "
+                        "(delegated LAPS reader, Domain Admin, or local admin of target)."
                     ),
                 )
 
@@ -350,11 +355,12 @@ class LapsReadableCheck(BaseCheck):
                 )
             if laps_managed:
                 return CheckResult(
-                    name=self.name, status=Status.FAIL,
+                    name=self.name, status=Status.WARN,
                     detail=(
                         f"LAPS managed computers found ({', '.join(laps_managed[:5])}) "
                         "but ms-Mcs-AdmPwd not readable with this account. "
-                        "Relay a higher-privileged account for password access."
+                        "Does not block the attack — relay a higher-privileged account "
+                        "for password access."
                     ),
                 )
 

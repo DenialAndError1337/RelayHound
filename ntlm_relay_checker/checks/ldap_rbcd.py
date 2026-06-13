@@ -338,6 +338,11 @@ class WritableComputerObjectCheck(BaseCheck):
     """
 
     name = "Writable computer object exists (msDS-AllowedToActOnBehalfOfOtherIdentity)"
+    # Optional/informational: probes the OPERATOR's current write rights. RBCD is
+    # carried out via the relayed victim's rights, so "not writable by me" must
+    # NOT make the attack NOT VIABLE — viability is driven by the protocol
+    # prerequisites (LDAP signing / channel binding / DFL) checked above.
+    required = False
 
     def _run(self) -> CheckResult:
         rc, out, err = _run_bloodyad(
@@ -354,17 +359,20 @@ class WritableComputerObjectCheck(BaseCheck):
                     name=self.name, status=Status.PASS,
                     detail=(
                         f"Writable computer object(s): {display}. "
-                        "Relay can write msDS-AllowedToActOnBehalfOfOtherIdentity "
-                        "on these targets for RBCD."
+                        "Your current account can already write these — you can perform RBCD "
+                        "directly (write msDS-AllowedToActOnBehalfOfOtherIdentity), no relay "
+                        "needed for these. Relay a more privileged victim only for objects "
+                        "outside your current write rights."
                     ),
                     raw=out[:400],
                 )
             return CheckResult(
-                name=self.name, status=Status.FAIL,
+                name=self.name, status=Status.WARN,
                 detail=(
                     "No writable computer objects found for this account. "
-                    "RBCD requires GenericWrite or WriteDACL on a computer object "
-                    "to write msDS-AllowedToActOnBehalfOfOtherIdentity (the RBCD target). "
+                    "Does not block the attack — RBCD requires GenericWrite or WriteDACL "
+                    "on a computer object to write msDS-AllowedToActOnBehalfOfOtherIdentity "
+                    "(the RBCD target). "
                     "Note: this is separate from MAQ — a machine account to act as the "
                     "delegation principal is also needed (see MachineAccountQuota check). "
                     "A higher-privileged relayed account may have write access."

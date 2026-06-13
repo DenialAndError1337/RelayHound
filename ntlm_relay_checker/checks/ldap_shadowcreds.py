@@ -267,6 +267,11 @@ class WritableKeyCredentialLinkCheck(BaseCheck):
     """
 
     name = "Writable object exists (msDS-KeyCredentialLink)"
+    # Optional/informational: probes the OPERATOR's current write rights. Shadow
+    # Credentials is carried out via the relayed victim's rights, so "not writable
+    # by me" must NOT make the attack NOT VIABLE — viability is driven by the
+    # protocol prerequisites (LDAP signing / channel binding / DFL / KDC cert) above.
+    required = False
 
     def _run(self) -> CheckResult:
         rc, out, err = _run_bloodyad(
@@ -283,17 +288,19 @@ class WritableKeyCredentialLinkCheck(BaseCheck):
                     name=self.name, status=Status.PASS,
                     detail=(
                         f"Writable computer object(s): {display}. "
-                        "Relay can write msDS-KeyCredentialLink on these targets "
-                        "for Shadow Credentials."
+                        "Your current account can already write these — you can perform Shadow "
+                        "Credentials directly (write msDS-KeyCredentialLink), no relay needed "
+                        "for these. Relay a more privileged victim only for objects outside "
+                        "your current write rights."
                     ),
                     raw=out[:400],
                 )
             return CheckResult(
-                name=self.name, status=Status.FAIL,
+                name=self.name, status=Status.WARN,
                 detail=(
                     "No writable computer objects found for this account. "
-                    "Shadow Credentials requires GenericWrite or WriteDACL "
-                    "on a computer or user object. "
+                    "Does not block the attack — Shadow Credentials requires GenericWrite "
+                    "or WriteDACL on a computer or user object. "
                     "A higher-privileged relayed account may have write access."
                 ),
             )
