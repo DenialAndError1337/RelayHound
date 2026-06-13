@@ -6,7 +6,7 @@ import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 
 class Status(Enum):
@@ -30,10 +30,19 @@ class CheckResult:
 class AttackResult:
     attack_name: str
     checks: list[CheckResult] = field(default_factory=list)
+    # Optional per-module override. When set, the engine attaches the module's
+    # `module_viability(ar)` function here so a module can express verdict logic
+    # the generic status-aggregation can't (e.g. alternative OR-related paths).
+    # When None, the generic aggregation below is used.
+    viability_fn: Optional[Callable[["AttackResult"], str]] = None
 
     @property
     def viability(self) -> str:
-        statuses = [c.status for c in self.checks]
+        if self.viability_fn is not None:
+            return self.viability_fn(self)
+        return self._generic_viability()
+
+    def _generic_viability(self) -> str:
         if not self.checks:
             return "UNKNOWN"
         # Any required check failed → NOT VIABLE

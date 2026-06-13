@@ -993,6 +993,39 @@ class MssqlLoggedOnUsersCheck(BaseCheck):
 
 # ── attack check list ──────────────────────────────────────────────────────
 
+def module_viability(ar) -> str:
+    """
+    MSSQL-specific verdict (attached by the engine via AttackResult.viability_fn).
+
+    Direct sysadmin and impersonation-to-sysadmin are *alternative* paths to the
+    same outcome (a sysadmin shell on a host). Either one, confirmed on a single
+    host, makes the relay fully viable on that host — regardless of whether other
+    hosts lack the path or whether enrichment checks (linked servers, xp_dirtree,
+    SPN, logged-on users) came back empty.
+
+    Both `MssqlPrivilegeCheck` and `MssqlImpersonationCheck` only return PASS when
+    the path is confirmed on a host where Windows auth already succeeded, so a PASS
+    from either inherently means "auth + sysadmin path on >=1 host". We promote such
+    cases to VIABLE; the generic aggregation would otherwise downgrade them to
+    PARTIAL because of the (orthogonal) optional FAILs from the enrichment checks.
+
+    Everything else defers to the generic logic: required FAIL -> NOT VIABLE,
+    auth-but-no-sysadmin-path -> PARTIAL, etc.
+    """
+    base = ar._generic_viability()
+    if base == "NOT VIABLE":
+        # A required prerequisite failed (port/auth) — never override that.
+        return base
+
+    by_name = {c.name: c.status for c in ar.checks}
+    direct_sysadmin = by_name.get(MssqlPrivilegeCheck.name)
+    impersonation   = by_name.get(MssqlImpersonationCheck.name)
+
+    if direct_sysadmin == Status.PASS or impersonation == Status.PASS:
+        return "VIABLE"
+    return base
+
+
 def get_checks(env: TargetEnv) -> list[BaseCheck]:
     return [
         MssqlPortCheck(env),
