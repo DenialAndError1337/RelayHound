@@ -32,30 +32,30 @@ Prerequisites:
 """
 from __future__ import annotations
 
+import os
 import re
 import socket
-import subprocess
+import tempfile
 from typing import Optional
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 
 try:
-    from ldap3 import Server, Connection, NTLM, SUBTREE, ALL, MODIFY_ADD
+    from ldap3 import SUBTREE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
 
+try:
+    from impacket import tds
+    TDS_AVAILABLE = True
+except ImportError:
+    TDS_AVAILABLE = False
+from ..utils import _ldap_connect, _port_open, _run_nxc_mssql, _run_nxc_smb
+
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
 
 
 def _resolve(hostname: str) -> Optional[str]:
@@ -64,60 +64,6 @@ def _resolve(hostname: str) -> Optional[str]:
         return socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
     except (socket.gaierror, IndexError):
         return None
-
-
-def _ldap_connect(env: TargetEnv) -> Optional[object]:
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]
-            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
-        else:
-            auth_password = env.cred.password
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=auth_password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
-
-
-def _run_nxc_smb(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        cmd = ["nxc", "smb"] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_nxc_mssql(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        cmd = ["nxc", "mssql"] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
 
 
 # ── LDAP discovery ─────────────────────────────────────────────────────────
@@ -382,8 +328,9 @@ class SiteServerReachableCheck(BaseCheck):
 
         if not candidates:
             return CheckResult(
-                name=self.name, status=Status.WARN,
-                detail="SCCM detected but no site server hostname found in AD. "
+                name=self.name, status=Status.SKIP,
+                detail="SCCM detected but no site server hostname found in AD and none "
+                       "supplied via --extra-targets — could not test reachability. "
                        "Use --extra-targets to specify the site server IP/hostname manually.",
             )
 
@@ -471,6 +418,66 @@ class SiteDBRemoteCheck(BaseCheck):
         )
 
 
+def _mssql_ntlm_probe(db_ip: str, env: TargetEnv) -> Optional[str]:
+    """Direct, non-destructive impacket TDS probe of whether MSSQL accepts NTLM.
+
+    This is the same authentication attempt nxc makes, but it reads a structured
+    login result instead of scraping stdout — used only as a fallback when the
+    nxc banner parse is inconclusive. Read-only: a login attempt performs no
+    writes (mirrors output.py's documented ``impacket-mssqlclient -windows-auth``
+    manual TAKEOVER-1 verification step).
+
+    Returns:
+        "auth_ok"       — NTLM login succeeded (MSSQL accepts NTLM, creds valid).
+        "ntlm_accepted" — server completed the NTLM handshake but rejected the
+                          supplied identity. Still proves MSSQL speaks NTLM:
+                          TAKEOVER-1 relays the site-server machine account
+                          (db_owner on the site DB by SCCM design), not the
+                          operator's creds, so the relay prerequisite is met.
+        None            — indeterminate (impacket missing, connect/protocol
+                          error, or no parseable login reply) -> keep WARN.
+    """
+    if not TDS_AVAILABLE:
+        return None
+
+    hashes = None
+    if env.cred.nt_hash:
+        # nt_hash may arrive as "nt" or "lm:nt"; impacket wants "lm:nt".
+        nt = env.cred.nt_hash.split(":")[-1]
+        hashes = f"aad3b435b51404eeaad3b435b51404ee:{nt}"
+
+    ms = None
+    try:
+        ms = tds.MSSQL(db_ip, 1433)
+        ms.connect()
+        ok = ms.login(
+            None,                       # database
+            env.cred.username,
+            env.cred.password or "",
+            env.domain,
+            hashes=hashes,
+            useWindowsAuth=True,
+        )
+        if ok:
+            return "auth_ok"
+        # login() returned False. A populated reply set means the NTLM handshake
+        # completed and the server returned a login result at the SQL layer
+        # (i.e. it speaks NTLM). A server that does not speak integrated auth
+        # makes impacket raise during challenge parsing instead of returning
+        # cleanly, so we gate "accepts NTLM" on an actual reply being present.
+        if getattr(ms, "replies", None):
+            return "ntlm_accepted"
+        return None
+    except Exception:
+        return None
+    finally:
+        if ms is not None:
+            try:
+                ms.disconnect()
+            except Exception:
+                pass
+
+
 class SiteDBMSSQLCheck(BaseCheck):
     """Check MSSQL reachability and NTLM auth on the site DB (TAKEOVER-1 path)."""
 
@@ -522,11 +529,20 @@ class SiteDBMSSQLCheck(BaseCheck):
             self.env,
         )
         combined = out + err
-        ntlm_ok = rc != -1 and (
-            "windows auth" in combined.lower() or
-            "ntlm" in combined.lower() or
-            "[+]" in combined
-        )
+        # Genuine auth success ONLY. The previous form also ORed
+        # `"ntlm" in combined` / `"windows auth" in combined`, which read a
+        # *negative* mention as a positive — a `(NTLM:False)`-style banner flag
+        # or a failed-login line that merely names NTLM / "windows auth" (e.g.
+        # "…cannot be used with Integrated authentication") would set ntlm_ok
+        # True and render TAKEOVER-1 VIABLE against a DB that did not accept the
+        # relayed auth (a false positive — cardinal-rule violation). "[+]" is
+        # netexec's unambiguous auth-success marker; every other case (creds
+        # rejected, handshake-only, unparseable) falls through to the structured
+        # `_mssql_ntlm_probe` below, which is strictly more capable — it detects
+        # `ntlm_accepted` (NTLM handshake completed but the SQL login was
+        # rejected), which is the case that actually matters for relay and which
+        # a banner substring cannot tell apart from a hard NTLM refusal.
+        ntlm_ok = rc != -1 and "[+]" in combined
 
         if rc == -1:
             return CheckResult(
@@ -545,12 +561,82 @@ class SiteDBMSSQLCheck(BaseCheck):
                 raw=out[:300],
             )
 
+        # nxc banner parse was inconclusive (typically: supplied creds rejected,
+        # or unparseable output). Fall back to a direct impacket TDS probe that
+        # reads a structured login result.
+        probe = _mssql_ntlm_probe(db_ip, self.env)
+        if probe == "auth_ok":
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=f"MSSQL reachable on {db_host} ({db_ip}) and accepts NTLM auth "
+                       "(confirmed via direct impacket probe). "
+                       "Relay site server machine account here for TAKEOVER-1.",
+                raw=combined[:300],
+            )
+        if probe == "ntlm_accepted":
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=f"MSSQL on {db_host} ({db_ip}) accepts NTLM — impacket probe "
+                       "completed the NTLM handshake (supplied creds were rejected at "
+                       "the SQL login layer). TAKEOVER-1 relays the site-server machine "
+                       "account, which holds db_owner on the site DB by SCCM design, so "
+                       "your creds need not be a valid SQL login — relay path viable. "
+                       "(EPA on the site DB, checked separately, can still block a "
+                       "relayed session.)",
+                raw=combined[:300],
+            )
+
         return CheckResult(
             name=self.name, status=Status.WARN,
             detail=f"MSSQL port 1433 open on {db_host} ({db_ip}) but NTLM auth status "
-                   "unclear from nxc output. Verify manually.",
+                   "unclear — nxc parse and impacket probe both inconclusive. "
+                   "Verify manually.",
             raw=combined[:300],
         )
+
+
+def _smb_signing_via_relay_list(db_ip: str, env: TargetEnv) -> Optional[bool]:
+    """Fallback SMB-signing probe using nxc's ``--gen-relay-list``.
+
+    Runs ``nxc smb <db_ip> --gen-relay-list <tmpfile>`` with NO credentials:
+    SMB signing is read from the protocol negotiation, so authentication is
+    unnecessary and avoids the auth-status noise that can make the credentialed
+    banner parse ambiguous (the original WARN path). nxc writes the host's IP
+    to the file IFF signing is *not required*.
+
+    Returns:
+        True  — signing not required (db_ip present in relay list) -> relayable
+        False — signing required (host not listed; banner shows signing enforced)
+        None  — indeterminate (nxc unavailable/errored, or no parseable signal)
+    """
+    fd, path = tempfile.mkstemp(prefix="nxc_relaychk_", suffix=".txt")
+    os.close(fd)
+    try:
+        rc, out, err = _run_nxc_smb([db_ip, "--gen-relay-list", path], env)
+        if rc == -1:
+            return None  # nxc missing or did not complete — not a verdict
+        try:
+            with open(path) as fh:
+                relay_list = fh.read()
+        except OSError:
+            relay_list = ""
+        # Primary signal: nxc writes the host IFF signing is not required.
+        if db_ip in relay_list:
+            return True
+        # Backstop: re-parse the banner printed during the gen-relay-list run.
+        combined = (out + err).lower()
+        if ("signing:true" in combined or "smb signing: true" in combined
+                or "signing required" in combined):
+            return False
+        if ("signing:false" in combined or "smb signing: false" in combined
+                or "signing not required" in combined):
+            return True
+        return None
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 class SiteDBSMBSigningCheck(BaseCheck):
@@ -628,9 +714,32 @@ class SiteDBSMBSigningCheck(BaseCheck):
                 raw=out[:300],
             )
 
+        # Credentialed banner parse was inconclusive. Fall back to
+        # `nxc --gen-relay-list` (unauthenticated; signing is read from the SMB
+        # negotiate). This is nxc's own relay-targetability determination.
+        relay_signing = _smb_signing_via_relay_list(db_ip, self.env)
+        if relay_signing is True:
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=f"SMB signing not required on site DB {db_host} ({db_ip}) "
+                       "— confirmed via nxc --gen-relay-list fallback. "
+                       "TAKEOVER-2 (relay to SMB) viable.",
+                raw=combined[:300],
+            )
+        if relay_signing is False:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=f"SMB signing enforced on site DB {db_host} ({db_ip}) "
+                       "— confirmed via nxc --gen-relay-list fallback. "
+                       "TAKEOVER-2 (relay to SMB) blocked. Use TAKEOVER-1 (MSSQL relay) instead.",
+                raw=combined[:300],
+            )
+
         return CheckResult(
             name=self.name, status=Status.WARN,
-            detail=f"SMB reachable on {db_host} but signing status unclear. Verify manually.",
+            detail=f"SMB reachable on {db_host} but signing status unclear — "
+                   "credentialed parse and --gen-relay-list fallback both inconclusive. "
+                   "Verify manually.",
             raw=combined[:300],
         )
 

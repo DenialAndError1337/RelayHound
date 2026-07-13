@@ -18,86 +18,35 @@ Prerequisites:
   [OPT]  High-value groups with weak ACLs (Domain Admins, etc.)
 """
 from __future__ import annotations
-import socket
-import subprocess
 
-from .base import BaseCheck, CheckResult, Status
+from .base import BaseCheck, CheckResult, Status, ldap_or_relay_viability
 from ..config import TargetEnv
+from .relay_target_finder import relay_target_principals_note
+from ..utils import LdapSigningCheck
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, NTLM, SUBTREE, BASE, ALL
+    from ldap3 import SUBTREE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import _ldap_connect, _port_open, _run_bloodyad, ldaps_cb_fanout, _dc_list_label
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
-
-
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_bloodyad(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        cmd = ["bloodyAD", "--host", env.dc_ip, "-d", env.domain,
-               "-u", env.cred.username, *((["-H", env.cred.nt_hash] if env.cred.nt_hash else ["-p", env.cred.password]))] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        return -1, "", "bloodyAD not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _ldap_connect(env: TargetEnv):
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=env.cred.password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
 
 
 # ── individual checks ──────────────────────────────────────────────────────
 
 class LdapsPortCheck(BaseCheck):
-    """LDAPS must be reachable on port 636."""
+    """LDAPS reachable on port 636 — the LDAPS/TLS relay sub-path.
+
+    Under the OR relay-path model this is an alternative channel, not a hard gate:
+    with LDAPS unreachable, ACL writes still succeed over plain ldap:// when LDAP
+    signing is off. So required=False and viability is decided by module_viability.
+    """
 
     name = "LDAPS reachable (port 636)"
+    required = False
 
     def _run(self) -> CheckResult:
         if _port_open(self.env.dc_ip, 636, timeout=self.env.timeout):
@@ -112,35 +61,63 @@ class LdapsPortCheck(BaseCheck):
 
 
 class LdapsChannelBindingCheck(BaseCheck):
-    """LDAPS channel binding (EPA) must not be enforced."""
+    """LDAPS channel binding (EPA) not enforced — opens the ldaps:// relay path.
+
+    Under the OR model this is one alternative channel (CB=Never → TLS relay
+    viable), not a hard requirement: required=False so a CB FAIL alone does not
+    veto the attack when the plain-ldap:// (signing-off) or NTLMv1 path is open.
+    """
 
     name = "LDAPS channel binding (EPA) not enforced"
+    required = False
 
     def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
+        # Fan out over dc_targets() — CB=Never on ANY DC opens the ldaps:// path.
+        status, open_dcs, blocked_dcs, soft_dcs, unknown_dcs = ldaps_cb_fanout(self.env)
+        multi = len(open_dcs) + len(blocked_dcs) + len(soft_dcs) + len(unknown_dcs) > 1
 
-        if rc == -1:
-            return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="nxc not available to check channel binding.")
-
-        if "channel binding is set to: never" in combined or "channel binding is not required" in combined:
+        if status is Status.PASS:
+            note = ""
+            if multi:
+                other = blocked_dcs + soft_dcs + unknown_dcs
+                note = (f" (enforced/undetermined on {_dc_list_label(self.env, other)}, "
+                        "relay to the permissive DC still succeeds)") if other else ""
             return CheckResult(
                 name=self.name, status=Status.PASS,
-                detail="LDAPS channel binding NOT required — relay viable.",
+                detail=f"LDAPS channel binding NOT required (Never) on "
+                       f"{_dc_list_label(self.env, open_dcs)} — relay viable.{note}",
             )
-        if "channel binding is set to: always" in combined or "channel binding is required" in combined:
+        if status is Status.FAIL:
+            scope = "all probed DCs" if multi else _dc_list_label(self.env, blocked_dcs)
             return CheckResult(
                 name=self.name, status=Status.FAIL,
-                detail="LDAPS channel binding REQUIRED — relay blocked.",
+                detail=(
+                    f"LDAPS channel binding enforced (Always / When Supported) on {scope} "
+                    "— ldaps:// relay path blocked (relayed no-CBT bind fails with "
+                    "SEC_E_BAD_BINDINGS). Plain ldap:// path (signing off) or NTLMv1 may "
+                    "still allow ACL writes — check those results."
+                ),
             )
-        if "channel binding is set to: when supported" in combined:
+        if status is Status.WARN:
             return CheckResult(
                 name=self.name, status=Status.WARN,
-                detail="Channel binding set to: When Supported — relay may work.",
+                detail=(
+                    f"LDAPS channel binding unconfirmed on {_dc_list_label(self.env, soft_dcs)} "
+                    "— cannot confirm CB=Never vs When Supported, so the ldaps:// relay path "
+                    "is unconfirmed. Check the plain-LDAP signing result; verify "
+                    "LdapEnforceChannelBinding (0=Never, 1=When Supported, 2=Always)."
+                ),
             )
-        return CheckResult(name=self.name, status=Status.WARN,
-                           detail="Channel binding status unclear.")
+        # SKIP
+        return CheckResult(
+            name=self.name, status=Status.SKIP,
+            detail=(
+                "Channel binding could not be determined on "
+                f"{_dc_list_label(self.env, unknown_dcs)} — nxc timed out / unavailable and "
+                "the direct LDAPS probe was inconclusive. Plain ldap:// (signing off) or "
+                "NTLMv1 may still allow ACL writes — check those results."
+            ),
+        )
 
 
 class WeakAclObjectsCheck(BaseCheck):
@@ -167,6 +144,13 @@ class WeakAclObjectsCheck(BaseCheck):
     required = False
 
     def _run(self) -> CheckResult:
+        result = self._run_base()
+        note = relay_target_principals_note(self.env, "ACLAbuse")
+        if note:
+            result.detail = (result.detail or "") + note
+        return result
+
+    def _run_base(self) -> CheckResult:
         # Try bloodyAD writable check
         rc, out, err = _run_bloodyad(["get", "writable"], self.env)
         if rc == 0 and out.strip():
@@ -361,11 +345,30 @@ class HighValueGroupsCheck(BaseCheck):
 # ── attack check list ──────────────────────────────────────────────────────
 
 def get_checks(env: TargetEnv) -> list[BaseCheck]:
+    # ACL modifications (WriteDACL to grant DCSync, group-membership adds) are
+    # ordinary SD/attribute writes — they relay over ANY one open channel:
+    #   • ldaps:// (LdapsChannelBindingCheck PASS)  — the original path
+    #   • plain ldap:// (LdapSigningCheck PASS)      — signing off; NEW path
+    #   • NTLMv1 (NtlmV1AuthProbeCheck PASS)         — SMB→LDAP relay enabler; NEW
+    # module_viability (ldap_or_relay_viability) ORs these; the LDAPS reachability
+    # and channel-binding checks are alternative channels (required=False), so an
+    # EPA-enforced / LDAPS-unreachable DC is no longer a false NOT VIABLE when
+    # plain-ldap signing is off.
+    from ..utils import NtlmV1AuthProbeCheck
     return [
         LdapsPortCheck(env),
         LdapsChannelBindingCheck(env),
+        LdapSigningCheck(env),
         WeakAclObjectsCheck(env),
         HighValueGroupsCheck(env),
+        NtlmV1AuthProbeCheck(env),
     ]
+
+
+# Attribute-write OR relay-path verdict (same shape as Shadow / LAPS / ADIDNS):
+# VIABLE if any one relay channel is open, then the (optional) target-object
+# prerequisites decide. base._ldap_relay_paths recognizes this module's LDAPS-
+# native channel-binding name as a TLS opener.
+module_viability = ldap_or_relay_viability
 
 ATTACK_NAME = "NTLM Relay → LDAPS (ACL Abuse)"

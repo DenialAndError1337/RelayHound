@@ -23,175 +23,26 @@ Prerequisites:
 from __future__ import annotations
 import re
 import subprocess
-from typing import Optional
 
-from .base import BaseCheck, CheckResult, Status
+from .base import BaseCheck, CheckResult, Status, ldap_or_relay_viability
 from ..config import TargetEnv
+from .relay_target_finder import relay_target_principals_note
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, ALL, NTLM, BASE, SUBTREE
+    from ldap3 import BASE, SUBTREE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import (LdapSigningCheck, LdapChannelBindingCheck,
+                     _ldap_connect_with_tls_fallback,
+                     _run_bloodyad, _run_certipy, _run_nxc_ldap,
+                     _certipy_ca_present, _certipy_enumerated, adcs_enrollment_verdict)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _ldap_connect(env: TargetEnv) -> Optional[object]:
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        # ldap3 NTLM accepts NT hash as "LMHASH:NTHASH" in the password field.
-        # Use the empty LM hash prefix when only the NT hash is supplied.
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]  # strip LM: prefix if present
-            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
-        else:
-            auth_password = env.cred.password
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=auth_password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
-
-
-def _run_bloodyad(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]
-            auth = ["--dc-ip", env.dc_ip, "-p", f":{nh}"]
-        else:
-            auth = ["-p", env.cred.password]
-        cmd = ["bloodyAD", "--host", env.dc_ip,
-               "-d", env.domain,
-               "-u", env.cred.username] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        return -1, "", "bloodyAD not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_certipy(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
-    try:
-        r = subprocess.run(["certipy-ad"] + args, capture_output=True,
-                           text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            r = subprocess.run(["certipy"] + args, capture_output=True,
-                               text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "certipy-ad not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
 
 # ── individual checks ──────────────────────────────────────────────────────
-
-class LdapSigningCheck(BaseCheck):
-    """LDAP signing must not be enforced for relay to succeed."""
-
-    name = "LDAP signing not enforced"
-
-    def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
-
-        if rc != -1:
-            if "ldap signing not enforced" in combined or "signing: false" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="LDAP signing NOT enforced — relay to LDAP viable.",
-                )
-            if "ldap signing enforced" in combined or "signing: true" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="LDAP signing REQUIRED (LdapServerIntegrity=2) — relay rejected.",
-                )
-
-        if LDAP3_AVAILABLE:
-            try:
-                from ldap3 import ANONYMOUS
-                server = Server(self.env.dc_ip, connect_timeout=self.env.timeout)
-                conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
-                if conn.bound:
-                    conn.unbind()
-                    return CheckResult(
-                        name=self.name, status=Status.PASS,
-                        detail="Anonymous LDAP bind succeeded — signing not enforced.",
-                    )
-            except Exception as e:
-                if "stronger" in str(e).lower() or "sign" in str(e).lower():
-                    return CheckResult(
-                        name=self.name, status=Status.FAIL,
-                        detail=f"LDAP requires signing: {e}",
-                    )
-
-        return CheckResult(name=self.name, status=Status.SKIP,
-                           detail="Could not determine LDAP signing status.")
-
-
-class LdapChannelBindingCheck(BaseCheck):
-    """LDAP channel binding must not be required."""
-
-    name = "LDAP channel binding not required"
-
-    def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
-
-        if rc == -1:
-            return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="nxc not available to check channel binding.")
-
-        if "channel binding is set to: never" in combined or "channel binding is not required" in combined:
-            return CheckResult(
-                name=self.name, status=Status.PASS,
-                detail="LDAP channel binding NOT required (set to: Never) — relay viable.",
-            )
-        if "channel binding is set to: always" in combined or "channel binding is required" in combined:
-            return CheckResult(
-                name=self.name, status=Status.FAIL,
-                detail="LDAP channel binding REQUIRED — relay blocked.",
-            )
-        if "channel binding is set to: when supported" in combined:
-            return CheckResult(
-                name=self.name, status=Status.WARN,
-                detail="Channel binding set to: When Supported — relay may work.",
-            )
-        return CheckResult(name=self.name, status=Status.WARN,
-                           detail="Channel binding status unclear. Review manually.")
-
 
 class DomainFunctionalLevelCheck(BaseCheck):
     """
@@ -213,10 +64,10 @@ class DomainFunctionalLevelCheck(BaseCheck):
         if not LDAP3_AVAILABLE:
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail="ldap3 not installed.")
-        conn = _ldap_connect(self.env)
+        conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
         if not conn:
             return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="LDAP connection failed.")
+                               detail="LDAP connection failed (tried plain and TLS).")
         try:
             domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
             conn.search(
@@ -274,6 +125,13 @@ class WritableKeyCredentialLinkCheck(BaseCheck):
     required = False
 
     def _run(self) -> CheckResult:
+        result = self._run_base()
+        note = relay_target_principals_note(self.env, "ShadowCreds")
+        if note:
+            result.detail = (result.detail or "") + note
+        return result
+
+    def _run_base(self) -> CheckResult:
         rc, out, err = _run_bloodyad(
             ["get", "writable", "--otype", "COMPUTER"], self.env
         )
@@ -306,7 +164,7 @@ class WritableKeyCredentialLinkCheck(BaseCheck):
             )
 
         if LDAP3_AVAILABLE:
-            conn = _ldap_connect(self.env)
+            conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
             if conn:
                 try:
                     domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
@@ -344,33 +202,52 @@ class WritableKeyCredentialLinkCheck(BaseCheck):
 
 class AdcsForPkinitCheck(BaseCheck):
     """
-    Optional: ADCS present for PKINIT/UnPAC-the-hash follow-up.
-    Shadow Credentials gives a TGT via PKINIT. To recover the NT hash
-    (UnPAC-the-hash), ADCS is needed. Without ADCS you still get a TGT
-    but cannot easily recover the hash.
+    Optional: ADCS present for the PKINIT / UnPAC-the-hash follow-up.
+    Shadow Credentials delivers via PKINIT, and PKINIT needs the KDC to hold a
+    KDC certificate — which only an Enterprise CA issues. So without ADCS the
+    PKINIT step fails outright (no TGT at all; lab-confirmed —
+    KDC_ERR_PADATA_TYPE_NOSUPP), not merely the UnPAC-the-hash recovery. With
+    ADCS the full chain works: Shadow Creds → PKINIT TGT → UnPAC-the-hash.
 
-    Method: nxc ldap --module adcs + certipy find.
+    Authoritative source is the shared adcs_enrollment_verdict() (RootDSE-based,
+    child-domain safe); nxc/certipy are positive-only enrichment on the
+    inconclusive path.
     """
 
     name = "ADCS present for PKINIT/UnPAC-the-hash follow-up"
     required = False
 
     def _run(self) -> CheckResult:
+        # Authoritative, child-domain-safe ADCS presence (RootDSE-based).
+        v = adcs_enrollment_verdict(self.env)
+        if v.status == Status.FAIL:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=(
+                    "No Enterprise CA in the forest. PKINIT needs the KDC to hold "
+                    "a KDC certificate (only an Enterprise CA issues one), so the "
+                    "Shadow Credentials → PKINIT step fails outright — no TGT, and "
+                    "therefore no UnPAC-the-hash either (lab-confirmed: KDC rejects "
+                    "the PKINIT AS-REQ with KDC_ERR_PADATA_TYPE_NOSUPP). Rare "
+                    "exception: a DC issued a KDC cert by a third-party/standalone "
+                    "PKI outside AD CS would still support PKINIT."
+                ),
+            )
+        if v.status == Status.PASS:
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail=(
+                    "Enterprise CA present — full chain viable: Shadow Creds → "
+                    "PKINIT TGT → UnPAC-the-hash → NT hash → pass-the-hash."
+                ),
+            )
+
+        # LDAP inconclusive (e.g. bind refused) → positive-only enrichment.
+        # nxc noSuchObject is NOT treated as FAIL: nxc string-builds the config
+        # NC from the domain, so it false-negatives in child domains.
         rc, out, err = _run_nxc_ldap(["--module", "adcs"], self.env)
         combined = out + err
-        lower = combined.lower()
-
         if rc != -1 and combined.strip():
-            if "nosuchobject" in lower or ("unexpected exception" in lower and "enrollment" in lower):
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail=(
-                        "No ADCS found in this domain. "
-                        "Shadow Credentials still gives a TGT via PKINIT, "
-                        "but UnPAC-the-hash (NT hash recovery) requires ADCS. "
-                        "Check parent/sibling domains for a CA."
-                    ),
-                )
             ca_names = re.findall(r"Found CN:[\s]*([^\s\n\r]+)", combined, re.IGNORECASE)
             if ca_names:
                 return CheckResult(
@@ -382,7 +259,6 @@ class AdcsForPkinitCheck(BaseCheck):
                     ),
                 )
 
-        # Fallback: certipy
         rc2, out2, err2 = _run_certipy([
             "find",
             "-u", f"{self.env.cred.username}@{self.env.domain}",
@@ -390,19 +266,17 @@ class AdcsForPkinitCheck(BaseCheck):
             "-dc-ip", self.env.dc_ip,
             "-stdout",
         ])
-        if rc2 != -1:
-            combined2 = (out2 + err2).lower()
-            if "certificate authorit" in combined2 or "ca name" in combined2:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="ADCS CA found via certipy — UnPAC-the-hash follow-up viable.",
-                )
+        if rc2 != -1 and _certipy_ca_present((out2 + err2).lower()):
+            return CheckResult(
+                name=self.name, status=Status.PASS,
+                detail="ADCS CA found via certipy — full PKINIT/UnPAC chain viable.",
+            )
 
         return CheckResult(
             name=self.name, status=Status.SKIP,
             detail=(
-                "Could not confirm ADCS presence. "
-                "Run: `certipy-ad find -u <user>@<domain> -p <pass> -dc-ip <dc> -stdout`"
+                "Could not confirm ADCS presence (LDAP probe inconclusive). "
+                "Run: `certipy-ad find -u <user>@<domain> -p <pass> -dc-ip <dc> -ldap-scheme ldap -stdout`"
             ),
         )
 
@@ -472,7 +346,6 @@ class WebClientCoercionCheck(BaseCheck):
         )
 
 
-
 class DcKdcCertificateCheck(BaseCheck):
     """
     The DC must have a KDC certificate to support PKINIT authentication.
@@ -514,7 +387,7 @@ class DcKdcCertificateCheck(BaseCheck):
                         "Shadow Credentials → PKINIT TGT → UnPAC-the-hash will work."
                     ),
                 )
-            if "certificate authorit" in lower or "ca name" in lower:
+            if _certipy_ca_present(lower):
                 return CheckResult(
                     name=self.name, status=Status.WARN,
                     detail=(
@@ -524,8 +397,9 @@ class DcKdcCertificateCheck(BaseCheck):
                         "(1.3.6.1.5.2.3.5) using `certipy find -stdout`."
                     ),
                 )
-            else:
-                # certipy ran successfully but found no CA or KDC template
+            if _certipy_enumerated(lower):
+                # certipy enumerated the directory and found no CA / KDC template
+                # → the DC genuinely has no KDC-certificate path.
                 return CheckResult(
                     name=self.name, status=Status.FAIL,
                     detail=(
@@ -535,49 +409,73 @@ class DcKdcCertificateCheck(BaseCheck):
                         "If a third-party CA is in use, verify manually."
                     ),
                 )
+            # certipy ran but never enumerated (connection error / unreachable DC):
+            # its "no CA" is not evidence of absence. Fall through to the
+            # authoritative LDAP probe below, which SKIPs on an unreachable DC
+            # instead of returning a false FAIL.
 
-        # Fallback: check ADCS via nxc
-        try:
-            import subprocess
-            r = subprocess.run(
-                ["nxc", "ldap", self.env.dc_ip,
-                 "-u", self.env.cred.username,
-                 *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
-                 "-d", self.env.domain,
-                 "--module", "adcs"],
-                capture_output=True, text=True, timeout=20,
+        # Fallback (certipy unavailable): authoritative LDAP probe. Use the
+        # shared verdict rather than nxc's adcs module — the helper reads the
+        # forest-root Configuration NC from RootDSE, so it's correct in child
+        # domains, whereas nxc string-builds the config NC from the domain name
+        # and returns a spurious noSuchObject in children (which would otherwise
+        # become a false FAIL here).
+        v = adcs_enrollment_verdict(self.env)
+        if v.status == Status.FAIL:
+            return CheckResult(
+                name=self.name, status=Status.FAIL,
+                detail=(
+                    "No Enterprise CA in the forest, so the DC has no KDC "
+                    "certificate and PKINIT is unavailable — Shadow Credentials "
+                    "cannot obtain a TGT (the KDC rejects the PKINIT AS-REQ with "
+                    "KDC_ERR_PADATA_TYPE_NOSUPP; lab-confirmed). Rare exception: a "
+                    "DC issued a KDC certificate by a third-party/standalone PKI "
+                    "(outside AD CS) would still support PKINIT despite no "
+                    "Enterprise CA being registered in the directory."
+                ),
             )
-            combined = (r.stdout + r.stderr).lower()
-            if "found cn" in combined or "found pki" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=(
-                        "ADCS detected — DC almost certainly has a KDC certificate "
-                        "via auto-enrollment. PKINIT authentication viable."
-                    ),
-                )
-            if "nosuchobject" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.WARN,
-                    detail=(
-                        "No ADCS in this domain. Check parent/sibling domain for a CA. "
-                        "DC needs a KDC certificate for PKINIT to work with Shadow Credentials."
-                    ),
-                )
-        except Exception:
-            pass
+        if v.status == Status.PASS:
+            return CheckResult(
+                name=self.name, status=Status.WARN,
+                detail=(
+                    "Enterprise CA present — the DC almost certainly has a KDC "
+                    "certificate via auto-enrollment, so PKINIT is viable. (The "
+                    "KDC Authentication template was not individually confirmed on "
+                    "this path; install certipy-ad for template-level detail.)"
+                ),
+            )
 
+        # Distinguish "certipy binary absent" from "certipy ran but couldn't
+        # enumerate" (e.g. DC unreachable / timed out) — rc == -1 is returned
+        # ONLY when the binary is missing. Reusing the "install certipy-ad"
+        # wording for a timeout misattributed the cause (seen in GOAD
+        # sc-unreachable: Certipy v5 ran and timed out, yet the detail said
+        # "not available").
+        if rc == -1:
+            skip_detail = (
+                "Could not verify KDC certificate status (LDAP probe inconclusive "
+                "and certipy-ad not installed). Install certipy-ad: pip install certipy-ad"
+            )
+        else:
+            skip_detail = (
+                "Could not verify KDC certificate status — certipy ran but did not "
+                "enumerate (DC unreachable / timed out) and the LDAP probe was also "
+                "inconclusive. Re-run against a reachable DC to confirm."
+            )
         return CheckResult(
             name=self.name, status=Status.SKIP,
-            detail=(
-                "Could not verify KDC certificate status. "
-                "Install certipy-ad: pip install certipy-ad"
-            ),
+            detail=skip_detail,
         )
 
 # ── attack check list ──────────────────────────────────────────────────────
 
+# OR relay-path verdict (signing OR channel-binding OR NTLMv1). Attached by the
+# engine via AttackResult.viability_fn.
+module_viability = ldap_or_relay_viability
+
+
 def get_checks(env: TargetEnv) -> list[BaseCheck]:
+    from ..utils import NtlmV1AuthProbeCheck
     return [
         LdapSigningCheck(env),
         LdapChannelBindingCheck(env),
@@ -586,6 +484,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         DcKdcCertificateCheck(env),
         AdcsForPkinitCheck(env),
         WebClientCoercionCheck(env),
+        NtlmV1AuthProbeCheck(env),
     ]
 
 ATTACK_NAME = "NTLM Relay → LDAP (Shadow Credentials)"

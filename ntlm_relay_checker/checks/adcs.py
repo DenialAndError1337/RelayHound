@@ -16,8 +16,6 @@ Prerequisites:
   [OPT]  certipy-ad confirms ESC8 vulnerability
 """
 from __future__ import annotations
-import socket
-import subprocess
 import urllib.request
 import urllib.error
 
@@ -25,6 +23,7 @@ from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 from .esc11 import RequestDispositionCheck
 from ..utils import CoercionAvailabilityCheck, adcs_enrollment_verdict
+from ..utils import _port_open, _run_certipy, _run_nxc_ldap, _certipy_ca_present, _certipy_enumerated
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -57,53 +56,6 @@ def _http_get(url: str, timeout: int = 10) -> tuple[int, dict, str]:
         return e.code, _merge_auth(e.headers), e.read(512).decode("utf-8", errors="replace")
     except Exception:
         return -1, {}, ""
-
-
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
-
-
-def _run_certipy(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
-    try:
-        result = subprocess.run(
-            ["certipy-ad"] + args, capture_output=True, text=True, timeout=timeout
-        )
-        return result.returncode, result.stdout, result.stderr
-    except FileNotFoundError:
-        try:
-            result = subprocess.run(
-                ["certipy"] + args, capture_output=True, text=True, timeout=timeout
-            )
-            return result.returncode, result.stdout, result.stderr
-        except FileNotFoundError:
-            return -1, "", "certipy-ad/certipy not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
 
 
 # ── individual checks ──────────────────────────────────────────────────────
@@ -190,7 +142,7 @@ class AdcsDeployedCheck(BaseCheck):
             "-stdout",
         ], timeout=30)
         combined2 = (out2 + err2).lower()
-        if rc2 != -1 and ("certificate authorit" in combined2 or "ca name" in combined2):
+        if rc2 != -1 and _certipy_ca_present(combined2):
             return CheckResult(
                 name=self.name, status=Status.PASS,
                 detail="AD CS CA found via certipy.",
@@ -219,12 +171,19 @@ class AdcsDeployedCheck(BaseCheck):
 class CertsrvHttpCheck(BaseCheck):
     """
     The /certsrv endpoint must be reachable for ESC8. NTLM relay over plain HTTP
-    (port 80) is the cleanest path; relay over HTTPS (443) is also viable when
-    EPA is not enforced on the binding (see HttpsEpaCheck). So HTTPS-only is NOT
-    a hard failure — it's a WARN deferring to the EPA check. We FAIL only when no
-    certsrv endpoint is reachable on either port.
+    (port 80) is the cleanest path and is the only case we can confirm remotely,
+    so it is the only PASS: GET http://<ca>/certsrv/ → 401 with WWW-Authenticate: NTLM.
 
-    Method: GET http(s)://<ca>/certsrv/ → 401 with WWW-Authenticate: NTLM
+    Relay over HTTPS (443) is also viable, but ONLY when EPA is not enforced on the
+    binding — and EPA is not remotely detectable (see HttpsEpaCheck). We therefore
+    cannot confirm relay viability from an HTTPS-only endpoint: it is genuinely
+    un-testable, so this returns SKIP (a required SKIP → the module renders
+    PARTIAL/conditional, never VIABLE, while EPA is unknown). Reporting VIABLE here
+    would false-positive the hardened "EPA enforced, HTTP disabled" configuration —
+    the exact "false viable" the tool exists to prevent. Likewise, a certsrv found
+    over HTTP but not offering an NTLM challenge (Kerberos-only, or an HTTPS redirect)
+    is un-confirmable as a relay target → SKIP. We FAIL only when no certsrv endpoint
+    is reachable on either port.
     """
 
     name = "Web enrollment endpoint reachable (HTTP or HTTPS)"
@@ -264,8 +223,10 @@ class CertsrvHttpCheck(BaseCheck):
                 ),
             )
 
-        # HTTPS path: confirm certsrv answers over TLS. Relay viability then
-        # depends on EPA (HttpsEpaCheck), so this is a WARN, not a hard pass/fail.
+        # HTTPS path: certsrv answers over TLS, but relay viability depends on EPA,
+        # which is NOT remotely detectable. We cannot confirm a viable relay path,
+        # so this is SKIP (un-testable), not WARN — a required WARN would fall
+        # through _generic_viability to VIABLE and false-positive an EPA-enforced CA.
         https_certsrv = []
         for host in https_targets:
             code, headers, body = _http_get(f"https://{host}/certsrv/", timeout=self.env.timeout)
@@ -274,20 +235,23 @@ class CertsrvHttpCheck(BaseCheck):
 
         if https_certsrv:
             return CheckResult(
-                name=self.name, status=Status.WARN,
+                name=self.name, status=Status.SKIP,
                 detail=(
                     f"/certsrv/ reachable over HTTPS on: {', '.join(https_certsrv)} "
-                    "(no plain-HTTP NTLM endpoint found). ESC8 over HTTPS is viable only "
-                    "if EPA is not enforced — see the HTTPS EPA check."
+                    "(no plain-HTTP NTLM endpoint found). ESC8 over HTTPS is viable ONLY "
+                    "if EPA is not enforced, which is not remotely detectable — see the "
+                    "HTTPS EPA check. Verdict left conditional (PARTIAL) rather than VIABLE "
+                    "until EPA is confirmed disabled manually."
                 ),
             )
 
         if other_http:
             return CheckResult(
-                name=self.name, status=Status.WARN,
+                name=self.name, status=Status.SKIP,
                 detail=(
                     f"/certsrv/ found over HTTP without an NTLM challenge: {', '.join(other_http)}. "
-                    "May use Kerberos-only auth or redirect to HTTPS."
+                    "May use Kerberos-only auth or redirect to HTTPS — could not confirm a "
+                    "plain-HTTP NTLM relay endpoint, so relay viability is un-testable here."
                 ),
             )
 
@@ -426,14 +390,29 @@ class EnrollableTemplateCheck(BaseCheck):
                     "2.5.29.37.0",
                 ])
 
-                # Check enrollment rights include machine accounts or DCs
-                block_lower = block.lower()
-                has_machine_enroll = any(term in block_lower for term in [
+                # Check that *enrollment rights* include machine accounts or DCs.
+                # Scoped to the "Enrollment Rights" subsection only: principals that
+                # appear under Object Control Permissions (Owner / Full Control /
+                # Write-DACL — ESC4-style write access, NOT enrollment) must not
+                # produce a false "machine can enroll" positive. If the field is
+                # absent, this stays False (conservative: no false-PASS).
+                #
+                # "domain users" is deliberately NOT in this list: ESC8 relays a
+                # machine account (DC$ / site-server$), and machine accounts are
+                # members of Domain Computers / Authenticated Users / Everyone —
+                # never Domain Users. Including it false-flagged user-only
+                # templates (e.g. the default "User" template) as machine-
+                # enrollable (GOAD-validated 2026-06-24).
+                er_m = re.search(
+                    r"Enrollment Rights\s*:(.*?)(?=\n\s{0,6}\w|\n\s*\[|\Z)",
+                    block, re.IGNORECASE | re.DOTALL,
+                )
+                enroll_rights = er_m.group(1).lower() if er_m else ""
+                has_machine_enroll = any(term in enroll_rights for term in [
                     "domain controllers",
                     "domain computers",
                     "enterprise domain controllers",
                     "authenticated users",
-                    "domain users",
                     "everyone",
                 ])
 
@@ -464,7 +443,7 @@ class EnrollableTemplateCheck(BaseCheck):
         # Fallback: LDAP query for published templates
         try:
             import ldap3
-            from ldap3 import Server, Connection, NTLM, SUBTREE
+            from ldap3 import Connection, NTLM, SUBTREE
             server = ldap3.Server(self.env.dc_ip, connect_timeout=self.env.timeout)
             if self.env.cred.nt_hash:
                 nh = self.env.cred.nt_hash.split(":")[-1]
@@ -568,16 +547,18 @@ class ESC8CertipyCheck(BaseCheck):
             # Extract CA name and web enrollment URL — skip error/info lines
             ca_match = re.search(r"CA Name[\s]*:[\s]*([^\r\n]+)", combined, re.IGNORECASE)
 
-            url_match = re.search(r"Web Enrollment[\s]*:[\s]*(https?://[^\s\r\n]+)", combined, re.IGNORECASE)
+            # certipy reports the web-enrollment host as the CA's "DNS Name"
+            # (v5 prints Web Enrollment as a nested HTTP/HTTPS block, never a URL).
+            dns_match = re.search(r"DNS Name[\s]*:[\s]*([^\s\r\n]+)", combined, re.IGNORECASE)
 
             ca_name = ca_match.group(1).strip() if ca_match else None
-            enroll_url = url_match.group(1).strip() if url_match else None
+            enroll_host = dns_match.group(1).strip() if dns_match else None
 
             parts = []
             if ca_name:
                 parts.append(f"CA: {ca_name}")
-            if enroll_url:
-                parts.append(f"Enrollment URL: {enroll_url}")
+            if enroll_host:
+                parts.append(f"web enrollment host: {enroll_host} (HTTP /certsrv)")
             if not parts:
                 parts.append("ESC8 confirmed")
 
@@ -605,6 +586,13 @@ class ESC8CertipyCheck(BaseCheck):
                 detail="certipy found no vulnerable configurations (ESC8 not present).",
             )
 
+        if not _certipy_enumerated(lower):
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="Could not determine ESC8 — certipy did not reach/enumerate "
+                       "the DC (connection error or unreachable).",
+                raw=combined[:400],
+            )
         return CheckResult(
             name=self.name, status=Status.WARN,
             detail="certipy ran but ESC8 status unclear. Review output manually.",

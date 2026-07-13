@@ -33,42 +33,25 @@ Prerequisites:
 from __future__ import annotations
 
 import socket
-import subprocess
-from typing import Optional
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
-from .sccm_takeover import _get_discovery, _port_open, _run_nxc_smb
+from .sccm_takeover import _get_discovery
 
 try:
-    from ldap3 import Server, Connection, NTLM, SUBTREE, ALL
+    import ldap3  # noqa: F401  - availability probe; ldap3 imported lazily in functions
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import _port_open, _run_nxc_smb
+from .ldap_dns import (
+    IMPACKET_AVAILABLE,
+    _discover_dns_zones,
+    _zone_createchild_trustees,
+)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def _ldap_connect(env: TargetEnv) -> Optional[object]:
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]
-            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
-        else:
-            auth_password = env.cred.password
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=auth_password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
 
 
 def _http_reachable(host: str, port: int, timeout: int = 5) -> bool:
@@ -157,7 +140,7 @@ class ClientPushNTLMFallbackCheck(BaseCheck):
         return False
 
     def _run(self) -> CheckResult:
-        disc = _get_discovery(self.env)
+        _get_discovery(self.env)
         return CheckResult(
             name=self.name, status=Status.WARN,
             detail=(
@@ -192,7 +175,7 @@ class UnsignedSMBRelayTargetsCheck(BaseCheck):
         return False
 
     def _run(self) -> CheckResult:
-        disc = _get_discovery(self.env)
+        _get_discovery(self.env)
         targets = list(self.env.extra_targets)
         if not targets:
             return CheckResult(
@@ -257,54 +240,74 @@ class ADIDNSWritableCheck(BaseCheck):
         return False
 
     def _run(self) -> CheckResult:
-        disc = _get_discovery(self.env)
+        # Reuse the ADIDNS module's DACL-aware, cached zone discovery so the
+        # ELEVATE-2.2 path is judged by the *same* signal as `--modules adidns`:
+        # PASS only when an open trustee (Authenticated Users / Everyone) actually
+        # holds CreateChild on a zone DACL — never on mere zone existence. Zone
+        # existence alone does NOT prove a relayed client-push account can write a
+        # record; a hardened zone (CreateChild removed) exists and is readable but
+        # is not writable by an arbitrary account. (_discover_dns_zones caches into
+        # env.shared_cache["adidns_zones"], shared with the adidns module.)
+        _get_discovery(self.env)
         if not LDAP3_AVAILABLE:
             return CheckResult(
                 name=self.name, status=Status.SKIP,
-                detail="ldap3 not available — cannot check ADIDNS writability.",
+                detail="ldap3 not available — cannot evaluate ADIDNS zone writability.",
             )
-
-        conn = _ldap_connect(self.env)
-        if not conn:
+        if not IMPACKET_AVAILABLE:
             return CheckResult(
                 name=self.name, status=Status.SKIP,
-                detail="LDAP connection failed — cannot check ADIDNS writability.",
+                detail="impacket not installed — cannot parse the DNS zone DACL to confirm "
+                       "CreateChild. Zone existence alone does not prove writability, so the "
+                       "ELEVATE-2.2 ADIDNS path is left unconfirmed. Install: pip install impacket",
             )
 
-        try:
-            domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
-            dns_zone_dn = (
-                f"DC={self.env.domain},CN=MicrosoftDNS,"
-                f"DC=DomainDnsZones,{domain_dn}"
+        zones = _discover_dns_zones(self.env)
+        if not zones:
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="No AD-integrated DNS zone DACL available to evaluate (zone enumeration "
+                       "inconclusive, or no primary zone) — ELEVATE-2.2 ADIDNS path unconfirmed.",
             )
-            conn.search(
-                search_base=dns_zone_dn,
-                search_filter="(objectClass=dnsZone)",
-                search_scope="BASE",
-                attributes=["distinguishedName"],
+
+        with_sd = [z for z in zones if z.get("raw_sd")]
+        if not with_sd:
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="DNS zone(s) found but their nTSecurityDescriptor could not be read "
+                       "(insufficient rights or SD control rejected) — cannot confirm CreateChild; "
+                       "ELEVATE-2.2 ADIDNS path unconfirmed.",
             )
-            zone_found = len(conn.entries) > 0
-        except Exception:
-            zone_found = False
 
-        conn.unbind()
+        open_grants: list[str] = []
+        for z in with_sd:
+            for _sid, label, scoped in _zone_createchild_trustees(z["raw_sd"]):
+                open_grants.append(
+                    f"{z['name']} ({label}{', object-scoped' if scoped else ''})"
+                )
 
-        if zone_found:
+        if open_grants:
+            uniq = list(dict.fromkeys(open_grants))
             return CheckResult(
                 name=self.name, status=Status.PASS,
                 detail=(
-                    f"LDAP bind succeeded and DNS zone accessible for {self.env.domain}. "
-                    "By default, authenticated domain users can add ADIDNS A-records. "
-                    "Use dnstool.py to register a record pointing to the relay server, "
-                    "then trigger client push via SharpSCCM — site server connects via "
-                    "HTTP allowing relay to LDAP(S) (ELEVATE-2.2)."
+                    "Open CreateChild on the DNS zone DACL — any authenticated domain user "
+                    f"(and thus a relayed client-push account) can add records: {', '.join(uniq[:6])}. "
+                    "Register an A-record for the relay host with dnstool.py, then trigger client "
+                    "push via SharpSCCM — the site server resolves it and connects over HTTP, "
+                    "relayable to LDAP(S) (ELEVATE-2.2)."
                 ),
             )
 
+        scanned = ", ".join(z["name"] for z in with_sd[:5])
         return CheckResult(
-            name=self.name, status=Status.WARN,
-            detail="DNS zone not found or not accessible via LDAP. "
-                   "ADIDNS writability for ELEVATE-2.2 HTTP path could not be confirmed.",
+            name=self.name, status=Status.FAIL,
+            detail=(
+                f"No CreateChild ACE for Authenticated Users/Everyone on the scanned zone(s): "
+                f"{scanned}. The zone DACL is hardened — an arbitrary relayed client-push account "
+                "cannot create the spoof record, so the ELEVATE-2.2 open-trustee path is not "
+                "confirmed (still possible only if you relay a principal that holds CreateChild)."
+            ),
         )
 
 
@@ -375,6 +378,44 @@ class SiteServerWebClientCheck(BaseCheck):
 
 
 # ── Module entry point ─────────────────────────────────────────────────────
+
+def module_viability(ar) -> str:
+    """
+    SCCM ELEVATE-2 verdict (attached by the engine via AttackResult.viability_fn).
+
+    ELEVATE-2 relays a coerced client-push authentication to a destination. The
+    trigger (automatic client push + 'Allow connection fallback to NTLM') is NOT
+    remotely detectable — ClientPushNTLMFallbackCheck is always WARN — and a
+    reachable management point is only the coercion *source*, not a relay
+    *destination*. So a reachable MP alone must NOT render VIABLE: that would claim
+    a viable relay with (a) nowhere confirmed to relay to and (b) an unconfirmable
+    trigger — the "false viable" the tool exists to prevent, and inconsistent with
+    the couldn't-determine → not-VIABLE rule applied to EPA / LDAP signing /
+    channel binding elsewhere.
+
+    VIABLE therefore requires >=1 CONFIRMED relay path:
+      - UnsignedSMBRelayTargetsCheck PASS  (ELEVATE-2.1: relay to an unsigned SMB host), or
+      - ADIDNSWritableCheck PASS           (ELEVATE-2.2: ADIDNS record → HTTP → relay to LDAP(S)).
+    With a reachable MP but neither path confirmed, the verdict is PARTIAL
+    (conditional): the attack may still work if the undetectable trigger is enabled
+    and a relay destination exists out of scope (e.g. --extra-targets not supplied),
+    but we cannot confirm it — so not VIABLE. (WebClient-running is a coercion
+    enabler for the 2.2 path, not itself a confirmed relay destination, so it does
+    not gate VIABLE on its own.)
+    """
+    base = ar._generic_viability()
+    if base in ("NOT VIABLE", "UNKNOWN"):
+        # MP unreachable (gatekeeper FAIL) → NOT VIABLE; nothing testable → UNKNOWN.
+        return base
+
+    by_name = {c.name: c.status for c in ar.checks}
+    smb_path    = by_name.get(UnsignedSMBRelayTargetsCheck.name)
+    adidns_path = by_name.get(ADIDNSWritableCheck.name)
+
+    if smb_path == Status.PASS or adidns_path == Status.PASS:
+        return "VIABLE"     # >=1 confirmed relay destination
+    return "PARTIAL"        # MP reachable but no confirmed relay path → conditional
+
 
 def get_checks(env: TargetEnv) -> list[BaseCheck]:
     return [

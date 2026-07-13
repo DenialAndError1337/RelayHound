@@ -24,159 +24,25 @@ Prerequisites:
 from __future__ import annotations
 import re
 import subprocess
-from typing import Optional
 
-from .base import BaseCheck, CheckResult, Status
+from .base import BaseCheck, CheckResult, Status, rbcd_or_relay_viability
 from ..config import TargetEnv
+from .relay_target_finder import relay_target_principals_note
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, ALL, NTLM, BASE, SUBTREE
+    from ldap3 import BASE, SUBTREE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import (LdapSigningCheck, LdapChannelBindingCheck,
+                     _ldap_connect_with_tls_fallback,
+                     _run_bloodyad, _run_nxc_ldap)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _ldap_connect(env: TargetEnv) -> Optional[object]:
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        # ldap3 NTLM accepts NT hash as "LMHASH:NTHASH" in the password field.
-        # Use the empty LM hash prefix when only the NT hash is supplied.
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]  # strip LM: prefix if present
-            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
-        else:
-            auth_password = env.cred.password
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=auth_password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
-
-
-def _run_bloodyad(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]
-            auth = ["--dc-ip", env.dc_ip, "-p", f":{nh}"]
-        else:
-            auth = ["-p", env.cred.password]
-        cmd = ["bloodyAD", "--host", env.dc_ip,
-               "-d", env.domain,
-               "-u", env.cred.username] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        return -1, "", "bloodyAD not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
 
 # ── individual checks ──────────────────────────────────────────────────────
-
-class LdapSigningCheck(BaseCheck):
-    """LDAP signing must not be enforced for relay to succeed."""
-
-    name = "LDAP signing not enforced"
-
-    def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
-
-        if rc != -1:
-            if "ldap signing not enforced" in combined or "signing: false" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="LDAP signing NOT enforced — relay to LDAP viable.",
-                )
-            if "ldap signing enforced" in combined or "signing: true" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="LDAP signing REQUIRED (LdapServerIntegrity=2) — relay rejected.",
-                )
-
-        if LDAP3_AVAILABLE:
-            try:
-                from ldap3 import ANONYMOUS
-                server = Server(self.env.dc_ip, connect_timeout=self.env.timeout)
-                conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
-                if conn.bound:
-                    conn.unbind()
-                    return CheckResult(
-                        name=self.name, status=Status.PASS,
-                        detail="Anonymous LDAP bind succeeded — signing not enforced.",
-                    )
-            except Exception as e:
-                if "stronger" in str(e).lower() or "sign" in str(e).lower():
-                    return CheckResult(
-                        name=self.name, status=Status.FAIL,
-                        detail=f"LDAP requires signing: {e}",
-                    )
-
-        return CheckResult(name=self.name, status=Status.SKIP,
-                           detail="Could not determine LDAP signing status.")
-
-
-class LdapChannelBindingCheck(BaseCheck):
-    """LDAP channel binding must not be required."""
-
-    name = "LDAP channel binding not required"
-
-    def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
-
-        if rc == -1:
-            return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="nxc not available to check channel binding.")
-
-        if "channel binding is set to: never" in combined or "channel binding is not required" in combined:
-            return CheckResult(
-                name=self.name, status=Status.PASS,
-                detail="LDAP channel binding NOT required (set to: Never) — relay viable.",
-            )
-        if "channel binding is set to: always" in combined or "channel binding is required" in combined:
-            return CheckResult(
-                name=self.name, status=Status.FAIL,
-                detail="LDAP channel binding REQUIRED — relay blocked.",
-            )
-        if "channel binding is set to: when supported" in combined:
-            return CheckResult(
-                name=self.name, status=Status.WARN,
-                detail="Channel binding set to: When Supported — relay may work.",
-            )
-        return CheckResult(name=self.name, status=Status.WARN,
-                           detail="Channel binding status unclear. Review manually.")
-
 
 class DomainFunctionalLevelCheck(BaseCheck):
     """
@@ -202,10 +68,10 @@ class DomainFunctionalLevelCheck(BaseCheck):
         if not LDAP3_AVAILABLE:
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail="ldap3 not installed.")
-        conn = _ldap_connect(self.env)
+        conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
         if not conn:
             return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="LDAP connection failed.")
+                               detail="LDAP connection failed (tried plain and TLS).")
         try:
             domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
             conn.search(
@@ -289,7 +155,7 @@ class MachineAccountQuotaCheck(BaseCheck):
                 )
 
         if LDAP3_AVAILABLE:
-            conn = _ldap_connect(self.env)
+            conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
             if conn:
                 try:
                     domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
@@ -345,6 +211,13 @@ class WritableComputerObjectCheck(BaseCheck):
     required = False
 
     def _run(self) -> CheckResult:
+        result = self._run_base()
+        note = relay_target_principals_note(self.env, "RBCD")
+        if note:
+            result.detail = (result.detail or "") + note
+        return result
+
+    def _run_base(self) -> CheckResult:
         rc, out, err = _run_bloodyad(
             ["get", "writable", "--otype", "COMPUTER"], self.env
         )
@@ -380,7 +253,7 @@ class WritableComputerObjectCheck(BaseCheck):
             )
 
         if LDAP3_AVAILABLE:
-            conn = _ldap_connect(self.env)
+            conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
             if conn:
                 try:
                     domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
@@ -483,7 +356,13 @@ class WebClientCoercionCheck(BaseCheck):
 
 # ── attack check list ──────────────────────────────────────────────────────
 
+# OR relay-path verdict (signing OR channel-binding OR NTLMv1), with the RBCD
+# delegate-creation constraint. Attached by the engine via AttackResult.viability_fn.
+module_viability = rbcd_or_relay_viability
+
+
 def get_checks(env: TargetEnv) -> list[BaseCheck]:
+    from ..utils import NtlmV1AuthProbeCheck
     return [
         LdapSigningCheck(env),
         LdapChannelBindingCheck(env),
@@ -491,6 +370,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         MachineAccountQuotaCheck(env),
         WritableComputerObjectCheck(env),
         WebClientCoercionCheck(env),
+        NtlmV1AuthProbeCheck(env),
     ]
 
 ATTACK_NAME = "NTLM Relay → LDAP (RBCD)"

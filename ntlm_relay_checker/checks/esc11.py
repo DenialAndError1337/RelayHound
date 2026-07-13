@@ -25,75 +25,27 @@ References:
 """
 from __future__ import annotations
 import re
-import socket
-import subprocess
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 from ..utils import CoercionAvailabilityCheck, adcs_enrollment_verdict
+from ..utils import _port_open, _run_certipy, _run_nxc_ldap, _certipy_ca_present, _certipy_enumerated
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
-
 
 def _run_nxc(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
+    from ..utils import _subprocess_run_with_retry
+    cmd = ["nxc"] + args
     try:
-        cmd = ["nxc"] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
+        return _subprocess_run_with_retry(cmd, timeout)
     except FileNotFoundError:
+        cmd[0] = "crackmapexec"
         try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
+            return _subprocess_run_with_retry(cmd, timeout)
         except FileNotFoundError:
             return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_certipy(args: list[str], timeout: int = 45) -> tuple[int, str, str]:
-    try:
-        r = subprocess.run(["certipy-ad"] + args, capture_output=True,
-                           text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            r = subprocess.run(["certipy"] + args, capture_output=True,
-                               text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "certipy-ad not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
 
 
 # ── individual checks ──────────────────────────────────────────────────────
@@ -142,9 +94,9 @@ class AdcsDeployedCheck(BaseCheck):
                else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
-        ])
+        ], timeout=45)
         combined2 = (out2 + err2).lower()
-        if rc2 != -1 and ("certificate authorit" in combined2 or "ca name" in combined2):
+        if rc2 != -1 and _certipy_ca_present(combined2):
             return CheckResult(
                 name=self.name, status=Status.PASS,
                 detail="AD CS CA found via certipy.",
@@ -223,7 +175,7 @@ class CaEncryptionFlagCheck(BaseCheck):
             "-dc-ip", self.env.dc_ip,
             "-vulnerable",
             "-stdout",
-        ])
+        ], timeout=45)
 
         if rc == -1:
             return CheckResult(
@@ -261,7 +213,15 @@ class CaEncryptionFlagCheck(BaseCheck):
                     raw=combined[:400],
                 )
 
-        # certipy ran but no ESC11 mention — likely not vulnerable
+        # certipy ran but no ESC11 mention. If it never enumerated (unreachable
+        # DC / connection error), that's un-testable, not a finding.
+        if not _certipy_enumerated(lower):
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="Could not determine CA RPC encryption status — certipy "
+                       "did not reach/enumerate the DC.",
+                raw=combined[:300],
+            )
         if "no vulnerable" in lower or "esc11" not in lower:
             return CheckResult(
                 name=self.name, status=Status.WARN,
@@ -297,7 +257,7 @@ class Esc11CertipyCheck(BaseCheck):
             "-dc-ip", self.env.dc_ip,
             "-vulnerable",
             "-stdout",
-        ])
+        ], timeout=45)
 
         if rc == -1:
             return CheckResult(
@@ -315,6 +275,13 @@ class Esc11CertipyCheck(BaseCheck):
                 raw=combined[:400],
             )
 
+        if not _certipy_enumerated(combined.lower()):
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="Could not determine ESC11 — certipy did not reach/enumerate "
+                       "the DC (connection error or unreachable).",
+                raw=combined[:300],
+            )
         return CheckResult(
             name=self.name, status=Status.FAIL,
             detail="certipy did not find ESC11 — CA likely enforces RPC encryption.",
@@ -365,7 +332,6 @@ class SmbSigningForCoercionCheck(BaseCheck):
                 "Coercion still possible via WebDAV, LLMNR/NBT-NS poisoning, or PrinterBug."
             ),
         )
-
 
 
 class EnrollableTemplateCheck(BaseCheck):
@@ -469,7 +435,7 @@ class EnrollableTemplateCheck(BaseCheck):
         # Fallback: LDAP query for published templates
         try:
             import ldap3
-            from ldap3 import Server, Connection, NTLM, SUBTREE
+            from ldap3 import Connection, NTLM, SUBTREE
             server = ldap3.Server(self.env.dc_ip, connect_timeout=self.env.timeout)
             auth_pw = (
                 f"aad3b435b51404eeaad3b435b51404ee:{self.env.cred.nt_hash.split(':')[-1]}"
@@ -556,7 +522,7 @@ class RequestDispositionCheck(BaseCheck):
             *((["-H", self.env.cred.nt_hash] if self.env.cred.nt_hash else ["-p", self.env.cred.password])),
             "-dc-ip", self.env.dc_ip,
             "-stdout",
-        ])
+        ], timeout=45)
 
         if rc == -1:
             return CheckResult(
@@ -595,7 +561,7 @@ class RequestDispositionCheck(BaseCheck):
                 )
 
         # certipy ran but no disposition found — check for any CA output
-        if "certificate authorit" in lower or "ca name" in lower:
+        if _certipy_ca_present(lower):
             return CheckResult(
                 name=self.name, status=Status.WARN,
                 detail=(

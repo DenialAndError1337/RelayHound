@@ -4,11 +4,20 @@ Check engine: discovers all attack modules, runs checks, returns AttackResults.
 from __future__ import annotations
 import importlib
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from .checks.base import AttackResult, CheckResult, Status
-from .checks.relay_target_finder import RelayTargetSummary, run_relay_target_finder
+from .checks.relay_target_finder import RelayTargetSummary, run_relay_target_finder, relay_target_results
 from .config import TargetEnv
+
+# Default cap on how many attack modules run at once in --parallel mode. One thread
+# per module (13) can overwhelm the DC/network so per-check subprocess probes
+# (nxc/certipy) hit --timeout and SKIP, making --parallel under-report vs sequential
+# (2026-07-08 GOAD Part F). A bounded pool reduces that burst (and is quieter). This
+# is a conservative starting point, not a tuned value — override with --max-parallel
+# if probes still time out (raise --timeout) or to go faster on a resilient DC.
+DEFAULT_MAX_PARALLEL = 5
 
 ATTACK_MODULES = [
     ("ntlm_relay_checker.checks.smb",               "NTLM Relay → SMB (secretsdump)"),        # 0  smb
@@ -23,6 +32,7 @@ ATTACK_MODULES = [
     ("ntlm_relay_checker.checks.ldaps_aclabuse",     "NTLM Relay → LDAPS (ACL Abuse)"),        # 9  acl
     ("ntlm_relay_checker.checks.sccm_takeover",      "NTLM Relay → SCCM (TAKEOVER-1/2)"),      # 10 sccm_takeover
     ("ntlm_relay_checker.checks.sccm_elevate2",      "NTLM Relay → SCCM (ELEVATE-2)"),         # 11 sccm_elevate2
+    ("ntlm_relay_checker.checks.ldap_dns",           "NTLM Relay → LDAP (ADIDNS Spoofing)"),   # 12 adidns
 ]
 
 
@@ -32,14 +42,20 @@ def run_all_checks(
     modules: list | None = None,
     delay: int = 0,
     jitter: int = 0,
+    module_started_callback: Callable[[str, int, int], None] | None = None,
+    module_finished_callback: Callable[[str, AttackResult], None] | None = None,
 ) -> list[AttackResult]:
     import time, random
     active = list(modules if modules is not None else ATTACK_MODULES)
     if delay > 0:
         random.shuffle(active)
     results: list[AttackResult] = []
+    total = len(active)
 
     for i, (mod_path, attack_name) in enumerate(active):
+        if module_started_callback:
+            module_started_callback(attack_name, i + 1, total)
+
         try:
             mod = importlib.import_module(mod_path)
         except ImportError as e:
@@ -49,10 +65,13 @@ def run_all_checks(
                 detail=f"Failed to import check module: {e}",
             ))
             results.append(ar)
+            if module_finished_callback:
+                module_finished_callback(attack_name, ar)
             continue
 
         checks = mod.get_checks(env)
         ar = AttackResult(attack_name=attack_name)
+        ar.viability_fn = getattr(mod, "module_viability", None)
 
         blocked_by: str | None = None
         for check in checks:
@@ -74,6 +93,8 @@ def run_all_checks(
                 blocked_by = check.name
 
         results.append(ar)
+        if module_finished_callback:
+            module_finished_callback(attack_name, ar)
 
         # Apply delay + jitter between modules (not after the last one)
         if delay > 0 and i < len(active) - 1:
@@ -87,7 +108,17 @@ def run_checks_parallel(
     env: TargetEnv,
     progress_callback: Callable[[str, str, CheckResult], None] | None = None,
     modules: list | None = None,
+    module_finished_callback: Callable[[str, AttackResult], None] | None = None,
+    max_workers: int | None = None,
 ) -> list[AttackResult]:
+    """Run modules concurrently on a BOUNDED thread pool.
+
+    At most ``max_workers`` modules run at once (default DEFAULT_MAX_PARALLEL),
+    instead of one thread per module firing all at once — the latter overwhelmed the
+    DC and made per-check nxc/certipy probes time out → SKIP, under-reporting vs
+    sequential. Results keep input order; callbacks are unchanged. max_workers <= 0
+    or None → default; it is also capped at the module count.
+    """
     active = modules if modules is not None else ATTACK_MODULES
     results: list[AttackResult | None] = [None] * len(active)
     lock = threading.Lock()
@@ -102,10 +133,14 @@ def run_checks_parallel(
                 detail=f"Import error: {e}",
             ))
             results[idx] = ar
+            if module_finished_callback:
+                with lock:
+                    module_finished_callback(attack_name, ar)
             return
 
         checks = mod.get_checks(env)
         ar = AttackResult(attack_name=attack_name)
+        ar.viability_fn = getattr(mod, "module_viability", None)
 
         blocked_by: str | None = None
         for check in checks:
@@ -127,15 +162,18 @@ def run_checks_parallel(
                 blocked_by = check.name
 
         results[idx] = ar
+        if module_finished_callback:
+            with lock:
+                module_finished_callback(attack_name, ar)
 
-    threads = []
-    for i, (mod_path, attack_name) in enumerate(active):
-        t = threading.Thread(target=run_attack, args=(i, mod_path, attack_name), daemon=True)
-        threads.append(t)
-        t.start()
-
-    for t in threads:
-        t.join()
+    # Bounded pool: at most `workers` modules run concurrently. The pool's context
+    # exit waits for every submitted task (equivalent to joining all threads).
+    if not max_workers or max_workers <= 0:
+        max_workers = DEFAULT_MAX_PARALLEL
+    workers = max(1, min(max_workers, len(active)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for i, (mod_path, attack_name) in enumerate(active):
+            pool.submit(run_attack, i, mod_path, attack_name)
 
     return [r for r in results if r is not None]
 
@@ -144,5 +182,6 @@ __all__ = [
     "run_all_checks",
     "run_checks_parallel",
     "run_relay_target_finder",
+    "relay_target_results",
     "RelayTargetSummary",
 ]

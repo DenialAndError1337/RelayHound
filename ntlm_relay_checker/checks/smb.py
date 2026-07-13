@@ -8,39 +8,43 @@ Prerequisites:
   [OPT]  At least one target is NOT a DC (DCs require signing by default, but it can be disabled)
 """
 from __future__ import annotations
-import os
 import re
 import socket
-import struct
 import subprocess
 from typing import Optional
 
 from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
+from ..utils import _dns_srv_ips
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _run_nxc(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
     """Run netexec (nxc) and return (returncode, stdout, stderr)."""
+    from ..utils import _subprocess_run_with_retry
     try:
-        result = subprocess.run(
-            ["nxc"] + args,
-            capture_output=True, text=True, timeout=timeout
-        )
-        return result.returncode, result.stdout, result.stderr
+        return _subprocess_run_with_retry(["nxc"] + args, timeout)
     except FileNotFoundError:
-        # Try crackmapexec as fallback
         try:
-            result = subprocess.run(
-                ["crackmapexec"] + args,
-                capture_output=True, text=True, timeout=timeout
-            )
-            return result.returncode, result.stdout, result.stderr
+            return _subprocess_run_with_retry(["crackmapexec"] + args, timeout)
         except FileNotFoundError:
             return -1, "", "nxc/crackmapexec not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
+
+
+def _nxc_smb_reached(output: str) -> bool:
+    """True if nxc's SMB output shows it actually negotiated with the host.
+
+    nxc/crackmapexec only print their banner fields (name/domain/signing/SMBv1)
+    and a [+]/[-] or logon-failure auth result *after* a successful TCP+SMB
+    negotiation. On an unreachable host (no machine on that IP, or 445 filtered)
+    the tool still exits cleanly but prints only a connection error — so the
+    absence of these markers means "host not reached", which must read as SKIP
+    (un-testable), not as a WARN/inconclusive "we got a response".
+    """
+    low = output.lower()
+    return ("signing:" in low or "(name:" in low or "(domain:" in low
+            or "[+]" in low or "pwned" in low or "status_logon_failure" in low)
 
 
 def _impacket_smbclient(target: str, timeout: int = 10) -> tuple[int, str, str]:
@@ -55,145 +59,6 @@ def _impacket_smbclient(target: str, timeout: int = 10) -> tuple[int, str, str]:
         return -1, "", "smbclient not found"
     except subprocess.TimeoutExpired:
         return -1, "", "timeout"
-
-
-def _dns_srv_ips(domain: str, dns_server: str, timeout: int = 3) -> set[str]:
-    """
-    Query _ldap._tcp.dc._msdcs.<domain> SRV records against dns_server.
-    Returns the set of IPs that the SRV target hostnames resolve to.
-
-    Uses a raw DNS UDP socket — no external dependencies required.
-    The AD-integrated DNS server (dc_ip) is used so that internal zones
-    like north.sevenkingdoms.local are resolvable.
-    """
-    srv_name = f"_ldap._tcp.dc._msdcs.{domain}"
-    try:
-        tid = os.urandom(2)
-        # Standard query, recursion desired
-        header = tid + b'\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-        parts = srv_name.encode('ascii').split(b'.')
-        qname = b''.join(bytes([len(p)]) + p for p in parts) + b'\x00'
-        question = qname + b'\x00\x21\x00\x01'  # QTYPE=SRV(33), QCLASS=IN(1)
-
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.settimeout(timeout)
-        s.sendto(header + question, (dns_server, 53))
-        resp, _ = s.recvfrom(4096)
-        s.close()
-    except OSError:
-        return set()
-
-    # Parse answer section
-    ancount = struct.unpack('!H', resp[6:8])[0]
-    if ancount == 0:
-        return set()
-
-    # Skip past the question section
-    pos = 12
-    # Skip qname
-    while pos < len(resp):
-        if resp[pos] & 0xc0 == 0xc0:
-            pos += 2
-            break
-        if resp[pos] == 0:
-            pos += 1
-            break
-        pos += resp[pos] + 1
-    pos += 4  # skip QTYPE + QCLASS
-
-    def _decode_name(buf: bytes, offset: int) -> tuple[str, int]:
-        """Decode a DNS name at offset, following pointers. Returns (name, new_offset)."""
-        labels = []
-        visited = set()
-        orig_offset = offset
-        jumped = False
-        end_offset = offset
-        while offset < len(buf):
-            if offset in visited:
-                break
-            visited.add(offset)
-            length = buf[offset]
-            if length & 0xc0 == 0xc0:
-                if offset + 1 >= len(buf):
-                    break
-                ptr = struct.unpack('!H', buf[offset:offset+2])[0] & 0x3fff
-                if not jumped:
-                    end_offset = offset + 2
-                jumped = True
-                offset = ptr
-            elif length == 0:
-                if not jumped:
-                    end_offset = offset + 1
-                break
-            else:
-                labels.append(buf[offset+1:offset+1+length].decode('ascii', 'replace'))
-                offset += length + 1
-                if not jumped:
-                    end_offset = offset
-        return '.'.join(labels).lower(), end_offset
-
-    hostnames: list[str] = []
-    for _ in range(ancount):
-        if pos >= len(resp):
-            break
-        _, pos = _decode_name(resp, pos)
-        if pos + 10 > len(resp):
-            break
-        rtype = struct.unpack('!H', resp[pos:pos+2])[0]
-        rdlen = struct.unpack('!H', resp[pos+8:pos+10])[0]
-        pos += 10
-        if rtype == 33 and rdlen > 6:  # SRV record
-            # priority(2) weight(2) port(2) then target name
-            target_name, _ = _decode_name(resp, pos + 6)
-            if target_name:
-                hostnames.append(target_name)
-        pos += rdlen
-
-    # Resolve hostnames to IPs using the same DNS server
-    ips: set[str] = set()
-    for hostname in hostnames:
-        try:
-            # Point resolution at the AD DNS server
-            tid2 = os.urandom(2)
-            header2 = tid2 + b'\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-            parts2 = hostname.rstrip('.').encode('ascii').split(b'.')
-            qname2 = b''.join(bytes([len(p)]) + p for p in parts2) + b'\x00'
-            question2 = qname2 + b'\x00\x01\x00\x01'  # QTYPE=A(1), QCLASS=IN(1)
-            s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s2.settimeout(timeout)
-            s2.sendto(header2 + question2, (dns_server, 53))
-            resp2, _ = s2.recvfrom(4096)
-            s2.close()
-            ancount2 = struct.unpack('!H', resp2[6:8])[0]
-            # Skip question
-            pos2 = 12
-            while pos2 < len(resp2):
-                if resp2[pos2] & 0xc0 == 0xc0:
-                    pos2 += 2; break
-                if resp2[pos2] == 0:
-                    pos2 += 1; break
-                pos2 += resp2[pos2] + 1
-            pos2 += 4
-            for _ in range(ancount2):
-                if pos2 >= len(resp2): break
-                _, pos2 = _decode_name(resp2, pos2)
-                if pos2 + 10 > len(resp2): break
-                rtype2 = struct.unpack('!H', resp2[pos2:pos2+2])[0]
-                rdlen2 = struct.unpack('!H', resp2[pos2+8:pos2+10])[0]
-                pos2 += 10
-                if rtype2 == 1 and rdlen2 == 4:  # A record
-                    ip = '.'.join(str(b) for b in resp2[pos2:pos2+4])
-                    ips.add(ip)
-                pos2 += rdlen2
-        except OSError:
-            # Fall back to system resolver as a last resort
-            try:
-                ip = socket.gethostbyname(hostname.rstrip('.'))
-                ips.add(ip)
-            except OSError:
-                pass
-
-    return ips
 
 
 def _parse_nxc_domain(nxc_output: str) -> Optional[str]:
@@ -252,6 +117,8 @@ class SmbSigningCheck(BaseCheck):
         signed_hosts: list[str] = []
         errors: list[str] = []
 
+        banners: dict[str, str] = self.env.shared_cache.setdefault("smb_banners", {})
+
         for target in targets:
             rc, out, err = _run_nxc(
                 ["smb", target, "-u", self.env.cred.username,
@@ -259,11 +126,19 @@ class SmbSigningCheck(BaseCheck):
                  "-d", self.env.cred.domain],
                 timeout=self.env.timeout + 10,
             )
-            combined = (out + err).lower()
+            raw = out + err
+            combined = raw.lower()
 
             if rc == -1:
                 errors.append(f"{target}: tool unavailable or timeout")
                 continue
+
+            if not _nxc_smb_reached(raw):
+                errors.append(f"{target}: no SMB response (host unreachable or 445 filtered)")
+                continue
+
+            # Stash raw (case-preserved) banner for downstream checks (e.g. SMBv1 detection)
+            banners[target] = raw
 
             # nxc output: "signing:True" or "signing:False"
             if "signing:false" in combined or "signing: false" in combined:
@@ -271,7 +146,7 @@ class SmbSigningCheck(BaseCheck):
             elif "signing:true" in combined or "signing: true" in combined:
                 signed_hosts.append(target)
             else:
-                errors.append(f"{target}: could not parse signing status")
+                errors.append(f"{target}: banner present but signing field unparseable")
 
         if unsigned_hosts:
             return CheckResult(
@@ -327,10 +202,36 @@ class NtlmAuthEnabledCheck(BaseCheck):
                                detail="nxc not available.")
 
         lower = combined.lower()
-        if "ntlm" in lower and ("disabled" in lower or "blocked" in lower):
+        if not _nxc_smb_reached(combined):
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail=f"No SMB response from {self.env.dc_ip} (host unreachable or "
+                       "445 filtered) — could not test NTLM.",
+                raw=combined[:400],
+            )
+        # NTLM disabled / blocked on the DC → relay is impossible, so this
+        # REQUIRED gate must FAIL (not WARN — a WARN here leaves the relay
+        # module free to render VIABLE against a DC where relay cannot work,
+        # a cardinal-rule false positive). Two real-world surfaces, both
+        # confirmed against a "Restrict NTLM" DC in GOAD:
+        #   • netexec resolves the SMB negotiation to "(NTLM:False)" in its host
+        #     banner when the DC does not offer NTLM (e.g. "Restrict NTLM:
+        #     Incoming NTLM traffic = Deny all"); the auth line then fails with
+        #     the generic STATUS_NOT_SUPPORTED rather than a named NTLM status,
+        #     so we key off the explicit "(NTLM:False)" flag, not that status.
+        #   • impacket/other tooling surface the wire status verbatim as
+        #     STATUS_NTLM_BLOCKED (0xC0000418) — e.g. the domain-wide "NTLM
+        #     authentication in this domain" pass-through block.
+        # Anchor on those specific forms, never a loose "ntlm"+"disabled"/
+        # "blocked" co-occurrence (nxc output carries "ntlm" in its banner and
+        # unrelated "disabled"/"blocked" lines, which false-FAILed this gate).
+        if (re.search(r"ntlm:\s*false", lower)
+                or "status_ntlm_blocked" in lower
+                or "0xc0000418" in lower):
             return CheckResult(
                 name=self.name, status=Status.FAIL,
-                detail="NTLM authentication appears to be disabled by policy.",
+                detail="NTLM authentication is disabled/blocked on the DC "
+                       "(Restrict NTLM policy) — NTLM relay is not possible against it.",
                 raw=combined[:400],
             )
         if "status_logon_failure" in lower:
@@ -488,14 +389,107 @@ class NullSessionCheck(BaseCheck):
         if rc == -1:
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail="nxc not available.")
-        if "guest" in combined or "anonymous" in combined or "[+]" in combined:
+        if not _nxc_smb_reached(out + err):
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="No SMB response (host unreachable or 445 filtered) — "
+                       "could not test null/guest session.",
+            )
+        # A genuine empty-credential (null / anonymous) session is confirmed
+        # ONLY by netexec's "[+]" success marker — it prints "[+] …:" and
+        # appends "(Guest)" when the server accepted the bind as guest. The
+        # previous gate also ORed bare "guest"/"anonymous" substrings, which
+        # match a *negative* mention (a "(Guest:False)" banner flag, or an error
+        # like "anonymous logon not allowed") and would false-PASS. required is
+        # False so this never gated a relay verdict, but the finding must still
+        # be accurate. Guest vs anonymous is a detail-text distinction only.
+        if "[+]" in combined:
+            as_guest = "(guest)" in combined
             return CheckResult(
                 name=self.name, status=Status.PASS,
-                detail="Null/guest session accepted — expands enumeration surface.",
+                detail=("Null session accepted (guest-level) — expands enumeration surface."
+                        if as_guest else
+                        "Null/anonymous session accepted — expands enumeration surface."),
             )
         return CheckResult(
             name=self.name, status=Status.FAIL,
             detail="Null/guest session rejected (normal — not required for relay).",
+        )
+
+
+class SmbV1DetectedCheck(BaseCheck):
+    """
+    Hygiene/context check: flag any hosts still advertising SMBv1.
+
+    SMBv1 is the protocol EternalBlue (MS17-010) operates over and has been
+    disabled by default since Windows Server 2016 / Windows 10 1709.
+    Its presence is worth flagging in the report regardless of relay viability,
+    but it has no bearing on whether the secretsdump relay succeeds — that works
+    on SMBv2/v3 just as well.
+
+    This check is purely informational and must never affect the module verdict:
+      WARN = SMBv1 found on ≥1 host (hygiene finding — visible in reports)
+      PASS = all scanned hosts have SMBv1 disabled (clean)
+      SKIP = no banner data available
+
+    WARN and PASS are both verdict-neutral for optional checks. Do not return
+    FAIL here — an optional FAIL downgrades the verdict to PARTIAL.
+
+    Data source: shared_cache["smb_banners"] populated by SmbSigningCheck from
+    the nxc SMB banner line, which includes (SMBv1:True|False). No additional
+    network calls are made.
+    """
+
+    name = "SMBv1 detection (hygiene)"
+    required = False
+
+    def _run(self) -> CheckResult:
+        # Every return uses the stable class name (self.name) so the result's
+        # name matches the fingerprinted check identity. The varying specifics
+        # (which hosts, how many) live in `detail`, not in the name — a name that
+        # changes with the outcome would make the JSON/report `name` field
+        # nondeterministic and is a footgun for any name-keyed consumer.
+        banners: dict[str, str] = self.env.shared_cache.get("smb_banners", {})
+
+        if not banners:
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="No SMB banner data available (nxc unavailable or no targets scanned).",
+            )
+
+        smbv1_hosts: list[str] = []
+        smbv1_off_hosts: list[str] = []
+
+        for host, raw in banners.items():
+            m = re.search(r"\(SMBv1:(True|False)\)", raw, re.IGNORECASE)
+            if m:
+                if m.group(1).lower() == "true":
+                    smbv1_hosts.append(host)
+                else:
+                    smbv1_off_hosts.append(host)
+
+        if not smbv1_hosts and not smbv1_off_hosts:
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="SMBv1 field not present in any banner (older nxc version?).",
+            )
+
+        if smbv1_hosts:
+            off_note = (f" Clean: {', '.join(smbv1_off_hosts)}."
+                        if smbv1_off_hosts else "")
+            return CheckResult(
+                name=self.name,
+                status=Status.WARN,
+                detail=(
+                    f"SMBv1 ENABLED on {len(smbv1_hosts)} host(s): {', '.join(smbv1_hosts)}. "
+                    "Legacy protocol — EternalBlue (MS17-010) attack surface present. "
+                    f"Disable via: Set-SmbServerConfiguration -EnableSMB1Protocol $false.{off_note}"
+                ),
+            )
+
+        return CheckResult(
+            name=self.name, status=Status.PASS,
+            detail=f"SMBv1 disabled on all scanned hosts: {', '.join(smbv1_off_hosts)}.",
         )
 
 
@@ -507,6 +501,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         NtlmAuthEnabledCheck(env),
         NonDcTargetCheck(env),
         NullSessionCheck(env),
+        SmbV1DetectedCheck(env),
     ]
 
 ATTACK_NAME = "NTLM Relay → SMB (secretsdump)"

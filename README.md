@@ -129,7 +129,7 @@ Requires: `impacket` and `ldap3` (both available on Kali by default).
 
 ---
 
-## Usage
+# Usage
 
 ```
 python relayhound.py [options]
@@ -140,13 +140,20 @@ Target:
   --dc-ips                  Comma-separated IPs of additional known DCs (e.g. DCs
                             in other domains/forests) so they rank as DC-level
                             targets in attack paths
-  --extra-targets           Comma-separated IPs, hostnames, CIDR ranges,
-                            or dash ranges (e.g. 10.0.0.1,10.0.0.0/24,10.0.0.10-20)
+  --extra-targets           Comma-separated IPs, hostnames, CIDR ranges, or dash
+                            ranges (e.g. 10.0.0.1,10.0.0.0/24,10.0.0.10-20). A token
+                            starting with '@' reads targets from a file
+                            (@targets.txt: one per line, # comments allowed)
+  --exclude                 Comma-separated hosts/hostnames/CIDR subnets to EXCLUDE
+                            from checks (e.g. 10.0.0.9,dc03.corp.local,10.0.9.0/24).
+                            A '@'-prefixed token reads rules from a file (@scope.txt).
+                            Match rules, not targets — a /24 is one rule. The primary
+                            --dc-ip is never excluded
   --attacker-ip             Your Kali/attacker IP. Used to populate
                             commands in the attack paths output
   --attacker-hostname       Your Kali/attacker hostname. Used to populate
                             commands in the attack paths output
-  --targets-file            File with target IPs/ranges, one per line (# for comments)
+  (deprecated: --targets-file → --extra-targets @<file>;  --scope-file → --exclude @<file>)
 
 Credentials:
   -u, --username            Domain username (low-privilege account)      [required]
@@ -156,6 +163,11 @@ Credentials:
 
 Options:
   -v, --verbose             Show per-check details in terminal
+  -q, --quiet               Suppress NOT VIABLE modules from terminal output.
+                            Summary table and -v details only show VIABLE and
+                            PARTIAL results. File reports (MD/HTML/JSON) are
+                            unaffected. Stacks with -v: use -v -q to see
+                            per-check details for viable attacks only.
   --parallel                Run attack checks in parallel (faster)
   --modules LIST            Comma-separated list of module short names to run
                             (e.g. smb,rbcd,adcs). Invalid names print the full
@@ -175,7 +187,7 @@ Options:
   --no-relay-list           Skip writing the relay targets file
   --laps-scope FILE         Save LAPS-managed computer names to this file
   --no-laps-scope           Skip writing the LAPS scope file
-  --find-relay-targets      Scan nTSecurityDescriptor ACLs to identify which
+  --find-coercion-targets   Scan nTSecurityDescriptor ACLs to identify which
                             accounts are worth coercing and for which attack
 ```
 

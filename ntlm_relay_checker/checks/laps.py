@@ -1,150 +1,50 @@
 """
 LAPS dump prerequisite checks for NTLM Relay → LDAP (LAPS Password Dump).
 
-LAPS stores randomised local admin passwords in ms-Mcs-AdmPwd on computer
-objects. If a relayed account has read access, passwords for managed
-computers can be extracted without further exploitation.
+LAPS stores randomised local admin passwords on computer objects. Legacy
+"Microsoft LAPS" uses the ms-Mcs-AdmPwd attribute (cleartext); Windows LAPS
+(built-in since Win11/Server 2025, backportable) uses msLAPS-Password
+(cleartext) or msLAPS-EncryptedPassword (DPAPI-encrypted). If a relayed account
+has read access, passwords for managed computers can be extracted without
+further exploitation.
 
 Prerequisites:
   [REQ]  LDAP signing not enforced
   [REQ]  LDAP channel binding not required
-  [REQ]  LAPS deployed (ms-Mcs-AdmPwd attribute exists in schema)
-  [REQ]  Relayed account has read access to ms-Mcs-AdmPwd
+  [REQ]  LAPS deployed (legacy ms-Mcs-AdmPwd or Windows LAPS msLAPS-* schema)
+  [REQ]  Relayed account has read access to the LAPS password attribute
   [OPT]  Number of LAPS-managed computers (scope)
 
-nxc laps output formats:
-  Not readable: "[-] No result found with attribute ms-MCS-AdmPwd or msLAPS-Password !"
-  Readable:     "Computer:BRAAVOS$  User:  Password:7zNNeEb#BF4,f4"
+nxc ldap --module laps output formats (GOAD-confirmed 2026-07-04):
+  Readable:     "LAPS … [*] Getting LAPS Passwords"
+                "LAPS … Computer:BRAAVOS$ User:  Password:L@KUNBc4GJF27E"
+  Not readable: "LAPS … [*] Getting LAPS Passwords"
+                "LAPS … [-] No result found with attribute ms-MCS-AdmPwd or msLAPS-Password !"
+  No LAPS:      "LAPS … [*] Getting LAPS Passwords"
+                "LAPS … [-] No result found with attribute ms-MCS-AdmPwd or msLAPS-Password !"
+  NOTE: "Getting LAPS Passwords" and "No result found" are IDENTICAL in the
+  not-readable and no-LAPS cases — nxc cannot distinguish them. Only a real
+  Computer/Password pair confirms deployment; everything else falls through to
+  the ldap3 schema check.
 """
 from __future__ import annotations
-import subprocess
 
-from .base import BaseCheck, CheckResult, Status
+from .base import BaseCheck, CheckResult, Status, ldap_or_relay_viability
 from ..config import TargetEnv
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, NTLM, SUBTREE, BASE, ALL
+    from ldap3 import SUBTREE, BASE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import (LdapSigningCheck, LdapChannelBindingCheck,
+                     _ldap_connect_with_tls_fallback, _run_nxc_ldap)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _ldap_connect(env: TargetEnv):
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=env.cred.password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
-
 
 # ── individual checks ──────────────────────────────────────────────────────
-
-class LdapSigningCheck(BaseCheck):
-    """LDAP signing must not be enforced for relay to succeed."""
-
-    name = "LDAP signing not enforced"
-
-    def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
-
-        if rc != -1:
-            if "ldap signing not enforced" in combined or "signing: false" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="LDAP signing NOT enforced — relay viable.",
-                )
-            if "ldap signing enforced" in combined or "signing: true" in combined:
-                return CheckResult(
-                    name=self.name, status=Status.FAIL,
-                    detail="LDAP signing REQUIRED — relay rejected.",
-                )
-
-        if LDAP3_AVAILABLE:
-            try:
-                from ldap3 import ANONYMOUS
-                server = Server(self.env.dc_ip, connect_timeout=self.env.timeout)
-                conn = Connection(server, authentication=ANONYMOUS, auto_bind=True)
-                if conn.bound:
-                    conn.unbind()
-                    return CheckResult(
-                        name=self.name, status=Status.PASS,
-                        detail="Anonymous LDAP bind succeeded — signing not enforced.",
-                    )
-            except Exception as e:
-                if "stronger" in str(e).lower() or "sign" in str(e).lower():
-                    return CheckResult(
-                        name=self.name, status=Status.FAIL,
-                        detail=f"LDAP requires signing: {e}",
-                    )
-
-        return CheckResult(name=self.name, status=Status.SKIP,
-                           detail="Could not determine LDAP signing status.")
-
-
-class LdapChannelBindingCheck(BaseCheck):
-    """LDAP channel binding must not be required."""
-
-    name = "LDAP channel binding not required"
-
-    def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
-
-        if rc == -1:
-            return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="nxc not available.")
-
-        if "channel binding is set to: never" in combined or "channel binding is not required" in combined:
-            return CheckResult(
-                name=self.name, status=Status.PASS,
-                detail="LDAP channel binding NOT required — relay viable.",
-            )
-        if "channel binding is set to: always" in combined or "channel binding is required" in combined:
-            return CheckResult(
-                name=self.name, status=Status.FAIL,
-                detail="LDAP channel binding REQUIRED — relay blocked.",
-            )
-        if "channel binding is set to: when supported" in combined:
-            return CheckResult(
-                name=self.name, status=Status.WARN,
-                detail="Channel binding set to: When Supported — relay may work.",
-            )
-        return CheckResult(name=self.name, status=Status.WARN,
-                           detail="Channel binding status unclear. Review manually.")
-
 
 class LapsDeployedCheck(BaseCheck):
     """
@@ -155,7 +55,7 @@ class LapsDeployedCheck(BaseCheck):
             OR ldap3 schema check for the attribute
     """
 
-    name = "LAPS deployed (ms-Mcs-AdmPwd attribute exists)"
+    name = "LAPS deployed (legacy ms-Mcs-AdmPwd or Windows LAPS schema)"
 
     def _run(self) -> CheckResult:
         rc, out, err = _run_nxc_ldap(["--module", "laps"], self.env)
@@ -163,30 +63,25 @@ class LapsDeployedCheck(BaseCheck):
         lower = combined.lower()
 
         if rc != -1 and combined.strip():
-            # Readable: "Computer:HOST$  User:  Password:xxx"
+            # The ONLY reliable nxc signal that LAPS is both deployed AND readable
+            # is a real Computer/Password pair in the output (Run 1 capture:
+            # "LAPS … Computer:BRAAVOS$ User: Password:L@KUNBc4GJF27E").
+            # Two previously-accepted signals are NOT reliable (GOAD-confirmed
+            # 2026-07-04 against sevenkingdoms.local, which has no LAPS):
+            #   "Getting LAPS Passwords" — printed by nxc before querying,
+            #     regardless of whether LAPS is deployed.
+            #   "No result found with attribute ms-MCS-AdmPwd or msLAPS-Password"
+            #     — printed both when LAPS is deployed-but-unreadable AND when
+            #     LAPS is not deployed at all. Using it as PASS "schema confirmed"
+            #     false-PASSed this REQUIRED check on a LAPS-free domain, which
+            #     with LDAP signing off renders the LAPS module VIABLE — a
+            #     cardinal-rule false positive.
+            # Both ambiguous signals now fall through to the ldap3 schema check,
+            # which queries the schema directly and is unambiguous.
             if "computer:" in lower and "password:" in lower:
                 return CheckResult(
                     name=self.name, status=Status.PASS,
-                    detail="LAPS deployed — ms-Mcs-AdmPwd attribute present and populated.",
-                    raw=out[:300],
-                )
-            # Not readable but schema present:
-            # "[-] No result found with attribute ms-MCS-AdmPwd or msLAPS-Password !"
-            if "no result found with attribute ms-mcs-admpwd" in lower or \
-               "no result found with attribute mslaps" in lower:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail=(
-                        "LAPS schema confirmed (nxc queried ms-MCS-AdmPwd/msLAPS-Password). "
-                        "Account cannot read passwords — relay a more privileged account."
-                    ),
-                    raw=(out + err)[:300],
-                )
-            # nxc ran and mentioned LAPS
-            if "getting laps passwords" in lower:
-                return CheckResult(
-                    name=self.name, status=Status.PASS,
-                    detail="LAPS detected via nxc — ms-Mcs-AdmPwd attribute present.",
+                    detail="LAPS deployed and readable — password attribute present and populated.",
                     raw=out[:300],
                 )
 
@@ -195,10 +90,10 @@ class LapsDeployedCheck(BaseCheck):
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail="ldap3 not installed. Run: pip install ldap3")
 
-        conn = _ldap_connect(self.env)
+        conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
         if not conn:
             return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="LDAP connection failed.")
+                               detail="LDAP connection failed (tried plain and TLS).")
 
         try:
             domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
@@ -265,7 +160,7 @@ class LapsReadableCheck(BaseCheck):
       "[-] No result found with attribute ms-MCS-AdmPwd or msLAPS-Password !"
     """
 
-    name = "ms-Mcs-AdmPwd readable by current account"
+    name = "LAPS password readable by current account (legacy or Windows LAPS)"
     # Optional/informational: this probes the OPERATOR's current rights. The
     # relay uses the (privileged) relayed victim's read rights, so "not readable
     # by me" must NOT make the attack NOT VIABLE — viability is driven by the
@@ -312,10 +207,10 @@ class LapsReadableCheck(BaseCheck):
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail="ldap3 not installed.")
 
-        conn = _ldap_connect(self.env)
+        conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
         if not conn:
             return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="LDAP connection failed.")
+                               detail="LDAP connection failed (tried plain and TLS).")
 
         try:
             domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
@@ -397,10 +292,10 @@ class LapsManagedComputersCheck(BaseCheck):
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail="ldap3 not installed.")
 
-        conn = _ldap_connect(self.env)
+        conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
         if not conn:
             return CheckResult(name=self.name, status=Status.SKIP,
-                               detail="LDAP connection failed.")
+                               detail="LDAP connection failed (tried plain and TLS).")
 
         try:
             domain_dn = ",".join(f"DC={p}" for p in self.env.domain.split("."))
@@ -447,12 +342,11 @@ class LapsManagedComputersCheck(BaseCheck):
                 pass
 
 
-
 class LapsAclReadersCheck(BaseCheck):
     """
     Enumerate which accounts have LAPS read permissions on managed computers.
     Even if the current account can't read passwords, knowing which accounts
-    CAN read them identifies valuable relay targets.
+    CAN read them identifies valuable coercion targets.
 
     Uses impacket-dacledit filtering on two fixed GUIDs for legacy LAPS v1:
       54bafdd2-36a8-4147-8d5c-be6d79fc6e84 — ms-Mcs-AdmPwd (password)
@@ -461,7 +355,7 @@ class LapsAclReadersCheck(BaseCheck):
     These GUIDs are standardised and identical across all AD environments.
     """
 
-    name = "Accounts with LAPS read permissions (relay target candidates)"
+    name = "Accounts with LAPS read permissions (coercion target candidates)"
     required = False
 
     LAPS_PWD_GUID        = "54bafdd2-36a8-4147-8d5c-be6d79fc6e84"
@@ -509,7 +403,7 @@ class LapsAclReadersCheck(BaseCheck):
         """Return sAMAccountNames of LAPS-managed computers."""
         if not LDAP3_AVAILABLE:
             return []
-        conn = _ldap_connect(self.env)
+        conn, _via_tls = _ldap_connect_with_tls_fallback(self.env)
         if not conn:
             return []
         try:
@@ -650,7 +544,13 @@ class LapsWebClientCoercionCheck(BaseCheck):
 
 # ── attack check list ──────────────────────────────────────────────────────
 
+# OR relay-path verdict (signing OR channel-binding OR NTLMv1). Attached by the
+# engine via AttackResult.viability_fn.
+module_viability = ldap_or_relay_viability
+
+
 def get_checks(env: TargetEnv) -> list[BaseCheck]:
+    from ..utils import NtlmV1AuthProbeCheck
     return [
         LdapSigningCheck(env),
         LdapChannelBindingCheck(env),
@@ -659,6 +559,7 @@ def get_checks(env: TargetEnv) -> list[BaseCheck]:
         LapsManagedComputersCheck(env),
         LapsAclReadersCheck(env),
         LapsWebClientCoercionCheck(env),
+        NtlmV1AuthProbeCheck(env),
     ]
 
 ATTACK_NAME = "NTLM Relay → LDAP (LAPS Password Dump)"

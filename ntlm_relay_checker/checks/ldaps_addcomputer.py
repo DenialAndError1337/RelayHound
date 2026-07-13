@@ -24,59 +24,14 @@ from .base import BaseCheck, CheckResult, Status
 from ..config import TargetEnv
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, NTLM, BASE, ALL
+    from ldap3 import BASE
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import _ldap_connect, _port_open, _run_nxc_ldap, ldaps_cb_fanout, _dc_list_label
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
-
-
-def _run_nxc_ldap(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
-    try:
-        auth = (["-H", env.cred.nt_hash] if env.cred.nt_hash
-                else ["-p", env.cred.password])
-        cmd = ["nxc", "ldap", env.dc_ip,
-               "-u", env.cred.username,
-               "-d", env.domain] + auth + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _ldap_connect(env: TargetEnv):
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=env.cred.password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
 
 
 # ── individual checks ──────────────────────────────────────────────────────
@@ -111,7 +66,6 @@ class LdapsPortCheck(BaseCheck):
                 (self.env.dc_ip, 636), timeout=self.env.timeout
             ) as sock:
                 with ctx.wrap_socket(sock) as ssock:
-                    cert = ssock.getpeercert(binary_form=True)
                     tls_version = ssock.version()
 
             return CheckResult(
@@ -142,7 +96,11 @@ class LdapsChannelBindingCheck(BaseCheck):
     When set to Always, the relay tool must present a matching TLS certificate
     which is not possible in a standard relay scenario.
 
-    When set to Never or When Supported (default): relay viable.
+    Lab-confirmed 2026-07-02 (GOAD Castelblack→Winterfell): CB "When Supported"
+    BLOCKS the relayed no-CBT ldaps:// bind — the relay fails at authentication
+    with SEC_E_BAD_BINDINGS, not just at the write. The direct probe succeeds
+    (simple/anon bind, no CBT requirement) but is not a faithful proxy for the
+    relay under "When Supported". Only CB=Never (registry value 0) is relay-safe.
 
     Method: nxc ldap --module ldap-checker reads the registry value.
     """
@@ -150,44 +108,58 @@ class LdapsChannelBindingCheck(BaseCheck):
     name = "LDAPS channel binding (EPA) not enforced"
 
     def _run(self) -> CheckResult:
-        rc, out, err = _run_nxc_ldap(["--module", "ldap-checker"], self.env)
-        combined = (out + err).lower()
+        # Fan out over dc_targets(): the attacker relays to the most permissive DC,
+        # so CB=Never on ANY DC is viable (a child DC with CB off is no longer missed).
+        status, open_dcs, blocked_dcs, soft_dcs, unknown_dcs = ldaps_cb_fanout(self.env)
+        multi = len(open_dcs) + len(blocked_dcs) + len(soft_dcs) + len(unknown_dcs) > 1
 
-        if rc == -1:
-            return CheckResult(
-                name=self.name, status=Status.SKIP,
-                detail=(
-                    "nxc not available. "
-                    "Manual check: LdapEnforceChannelBinding registry value on DC. "
-                    "0=Never, 1=When Supported, 2=Always (blocks relay)."
-                ),
-            )
-
-        if "channel binding is set to: never" in combined or "channel binding is not required" in combined:
+        if status is Status.PASS:
+            note = ""
+            if multi:
+                other = blocked_dcs + soft_dcs + unknown_dcs
+                note = (f" (enforced/undetermined on {_dc_list_label(self.env, other)}, "
+                        "but a relay to the permissive DC still succeeds)") if other else ""
             return CheckResult(
                 name=self.name, status=Status.PASS,
-                detail="LDAPS channel binding NOT required (set to: Never) — relay viable.",
+                detail=f"LDAPS channel binding NOT required (set to: Never) on "
+                       f"{_dc_list_label(self.env, open_dcs)} — relay viable.{note}",
             )
-        if "channel binding is set to: always" in combined or "channel binding is required" in combined:
+        if status is Status.FAIL:
+            scope = "all probed DCs" if multi else _dc_list_label(self.env, blocked_dcs)
+            # ── FLIP POINT ── When Supported is treated as blocking (lab-confirmed:
+            # relayed no-CBT ldaps:// bind fails with SEC_E_BAD_BINDINGS). If a future
+            # lab run shows When Supported allows the relay, relax that leg in
+            # utils._ldaps_cb_posture_for_dc.
             return CheckResult(
                 name=self.name, status=Status.FAIL,
                 detail=(
-                    "LDAPS channel binding REQUIRED (set to: Always). "
-                    "Relay blocked — attacker cannot present matching TLS cert."
+                    f"LDAPS channel binding enforced (Always / When Supported) on {scope} "
+                    "— relay blocked. A relayed no-CBT ldaps:// bind fails with "
+                    "SEC_E_BAD_BINDINGS; only CB=Never (registry 0) allows the relay."
                 ),
             )
-        if "channel binding is set to: when supported" in combined:
+        if status is Status.WARN:
             return CheckResult(
                 name=self.name, status=Status.WARN,
                 detail=(
-                    "LDAPS channel binding set to: When Supported. "
-                    "Relay may work — depends on whether client signals EPA support."
+                    f"LDAPS channel binding unconfirmed on {_dc_list_label(self.env, soft_dcs)} "
+                    "— a no-CBT LDAPS bind succeeded (or nxc gave no registry read), which "
+                    "cannot distinguish CB=Never (relay viable) from CB=When Supported "
+                    "(relay blocked). Verify LdapEnforceChannelBinding on the DC "
+                    "(0=Never → viable, 1=When Supported → blocked, 2=Always → blocked)."
                 ),
             )
+        # SKIP: a DC could not be tested (nxc timed out / unavailable + probe
+        # inconclusive) and none is confirmed open.
         return CheckResult(
-            name=self.name, status=Status.WARN,
-            detail="Channel binding status unclear. Review manually.",
-            raw=(out + err)[:300],
+            name=self.name, status=Status.SKIP,
+            detail=(
+                "Channel binding could not be determined on "
+                f"{_dc_list_label(self.env, unknown_dcs)} — nxc ldap-checker timed out or is "
+                "unavailable and the direct LDAPS probe was inconclusive. Manual check: "
+                "LdapEnforceChannelBinding (0=Never relay viable, 1=When Supported blocked, "
+                "2=Always blocked)."
+            ),
         )
 
 
@@ -306,8 +278,6 @@ class LdapsTlsCertCheck(BaseCheck):
                     cert_obj = x509.load_der_x509_certificate(cert_der, default_backend())
                     subject_cn = cert_obj.subject.get_attributes_for_oid(
                         x509.NameOID.COMMON_NAME)
-                    issuer_cn = cert_obj.issuer.get_attributes_for_oid(
-                        x509.NameOID.COMMON_NAME)
                     cn = subject_cn[0].value if subject_cn else "N/A"
                     self_signed = cert_obj.subject == cert_obj.issuer
                 except ImportError:
@@ -327,7 +297,6 @@ class LdapsTlsCertCheck(BaseCheck):
         except Exception as e:
             return CheckResult(name=self.name, status=Status.SKIP,
                                detail=f"Could not read TLS cert: {e}")
-
 
 
 class LdapsWebClientCheck(BaseCheck):

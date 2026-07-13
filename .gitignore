@@ -27,3 +27,18 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Lint cache
+.ruff_cache/
+
+# Validation & harness artifacts (contain lab IPs / captured output — keep local)
+*.log
+*.sddl
+*.typescript
+tests/
+
+# Lab-specific validation runbooks (hardcoded lab creds/IPs — keep out of a public repo).
+# Delete a line here if you intend to publish it *after scrubbing* creds/IPs.
+validate_sccm_elevate2.sh
+harden_adidns_zone.ps1
+*_RUNBOOK.md

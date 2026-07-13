@@ -27,12 +27,12 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
+import threading
 
 from ..config import TargetEnv
 
 try:
-    import ldap3
-    from ldap3 import Server, Connection, NTLM, SUBTREE, BASE, ALL
+    from ldap3 import SUBTREE, BASE
     from ldap3.protocol.microsoft import security_descriptor_control
     LDAP3_AVAILABLE = True
 except ImportError:
@@ -43,6 +43,7 @@ try:
     IMPACKET_AVAILABLE = True
 except ImportError:
     IMPACKET_AVAILABLE = False
+from ..utils import _ldap_connect
 
 
 # ── attribute / right GUIDs ────────────────────────────────────────────────
@@ -65,6 +66,9 @@ ADS_READ_PROP  = 0x00000010   # ADS_RIGHT_DS_READ_PROP
 ACE_TYPE_ALLOWED        = 0x00
 ACE_TYPE_ALLOWED_OBJECT = 0x05
 ACE_OBJECT_TYPE_PRESENT = 0x01
+
+# ACE header (AceFlags) bits
+ACE_FLAG_INHERIT_ONLY   = 0x08   # ACE governs child inheritance only, not this object
 
 # Well-known SIDs to always filter from results — expected rights by design.
 # S-1-5-10 = SELF (the object itself) — not an exploitable trustee.
@@ -156,27 +160,6 @@ class RelayTargetSummary:
 
 
 # ── LDAP connection ────────────────────────────────────────────────────────
-
-def _ldap_connect(env: TargetEnv):
-    if not LDAP3_AVAILABLE:
-        return None
-    try:
-        server = Server(env.dc_ip, get_info=ALL, connect_timeout=env.timeout)
-        if env.cred.nt_hash:
-            nh = env.cred.nt_hash.split(":")[-1]
-            auth_password = f"aad3b435b51404eeaad3b435b51404ee:{nh}"
-        else:
-            auth_password = env.cred.password
-        conn = Connection(
-            server,
-            user=env.cred.upn,
-            password=auth_password,
-            authentication=NTLM,
-            auto_bind=True,
-        )
-        return conn
-    except Exception:
-        return None
 
 
 # ── SID helpers ────────────────────────────────────────────────────────────
@@ -320,6 +303,15 @@ def _parse_dacl(
         for ace in sd["Dacl"].aces:
             ace_type = ace["AceType"]
             if ace_type not in (ACE_TYPE_ALLOWED, ACE_TYPE_ALLOWED_OBJECT):
+                continue
+
+            # INHERIT_ONLY_ACE governs inheritance to child objects and does NOT
+            # grant its right on the object being scanned. Counting it would falsely
+            # report a right the principal doesn't hold here (e.g. an inherit-only
+            # WriteDACL on the domain root -> phantom "Domain Root (DCSync path)"
+            # -> false CRITICAL chain). Note: this is the ACE *header* flag
+            # (ace["AceFlags"]), distinct from the object-ACE's own Flags below.
+            if ace["AceFlags"] & ACE_FLAG_INHERIT_ONLY:
                 continue
 
             try:
@@ -641,3 +633,82 @@ def run_relay_target_finder(env: TargetEnv) -> RelayTargetSummary:
             pass
 
     return summary
+
+
+# ── cached entry point + per-attack consumption by check modules ─────────────
+
+_RTF_LOCK = threading.Lock()
+
+
+def relay_target_results(env: TargetEnv) -> RelayTargetSummary:
+    """Run the relay-target ACL scan at most once per run and cache the summary.
+
+    The scan is expensive (its own ldap3 connection, SID maps, and several DACL
+    searches), and with --find-coercion-targets several check modules may request it
+    concurrently under --parallel. So unlike the cheap probe caches (ldap-checker,
+    mssql role) this one is lock-guarded: the first caller runs the scan while the
+    rest wait, then everyone reads the cached summary from
+    shared_cache["relay_target_summary"]. relayhound's dedicated finder section
+    also calls this, so it reuses whatever a check already computed (or computes
+    it if no check did).
+    """
+    cached = env.shared_cache.get("relay_target_summary")
+    if cached is not None:
+        return cached
+    with _RTF_LOCK:
+        # Double-checked: another thread may have populated it while we waited.
+        cached = env.shared_cache.get("relay_target_summary")
+        if cached is not None:
+            return cached
+        summary = run_relay_target_finder(env)
+        env.shared_cache["relay_target_summary"] = summary
+        return summary
+
+
+def relay_target_principals_note(env: TargetEnv, attack: str) -> str:
+    """Return a note naming the principals that hold `attack`'s right, or "".
+
+    Consumed by the operator-rights checks (RBCD / ShadowCreds / ACLAbuse) to
+    answer "if my account can't do this, who can I relay instead?". Produces
+    output only when --find-coercion-targets is enabled; otherwise returns "" with
+    no scan (zero overhead when the flag is off).
+
+    `attack` is one of "RBCD", "ShadowCreds", "ACLAbuse", "LAPS". Honestly notes
+    that group entries are NOT expanded to members — the finder reports the
+    principal named directly in the ACE, so a listed group means "coerce a member
+    of that group", and the finder doesn't enumerate which members those are.
+    """
+    if not env.find_relay_targets:
+        return ""
+
+    summary = relay_target_results(env)
+    if summary.skipped:
+        return f"  [coercion-target ACL scan skipped: {summary.skipped}]"
+    if summary.error:
+        return f"  [coercion-target ACL scan error: {summary.error}]"
+
+    entries = [e for e in summary.entries if e.attack == attack]
+    if not entries:
+        return ("  Coercion-target ACL scan found no non-default principals holding "
+                "this right (built-in/high-privilege groups are filtered as noise) "
+                "— a Domain Admin-equivalent relay would be required.")
+
+    by_acct: dict[str, list[RelayTargetEntry]] = defaultdict(list)
+    for e in entries:
+        by_acct[e.account].append(e)
+
+    parts = []
+    for acct in sorted(by_acct)[:6]:
+        ents = by_acct[acct]
+        first = ents[0]
+        more = f" (+{len(ents) - 1} more)" if len(ents) > 1 else ""
+        parts.append(f"{acct} ({first.right} on {first.target_object}){more}")
+    overflow = (f" (+{len(by_acct) - 6} more account(s))"
+                if len(by_acct) > 6 else "")
+
+    return (
+        "  Coercion-target ACL scan — principals that hold this right "
+        f"(coerce/relay one of them): {'; '.join(parts)}{overflow}. "
+        "Note: group entries are not expanded to members — a listed group means "
+        "coerce a member of it."
+    )

